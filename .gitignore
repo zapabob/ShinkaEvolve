@@ -191,3 +191,4 @@ cython_debug/
 # Local editor metadata
 .idea/
 .vscode/
+*/git-rewrite
