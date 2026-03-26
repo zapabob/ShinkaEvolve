@@ -6,8 +6,7 @@ Compact Shinka task: pack `n=26` circles in a unit square, maximize sum of radii
 
 - `initial.py`: seed solution; exposes `run_packing()`.
 - `evaluate.py`: validator + scorer; runs `run_packing`, checks geometry constraints, writes metrics/artifacts.
-- `run_evo_async.py`: async evolution runner (uses top-level job concurrency keys from YAML).
-- `run_evo.py`: sync evolution runner.
+- `run_evo.py`: async evolution runner (uses top-level worker keys from YAML).
 - `shinka_small.yaml`, `shinka_medium.yaml`, `shinka_long.yaml`: run profiles.
 - `load_results.ipynb`: post-run analysis plots (incl. 2x3 dashboard).
 - `viz_circles.ipynb`: geometry-focused circle layout visualization.
@@ -17,13 +16,17 @@ Compact Shinka task: pack `n=26` circles in a unit square, maximize sum of radii
 | Config | Intended Use | Core Shape |
 |---|---|---|
 | `shinka_small.yaml` | default dev run | async `2/2/2` workers, `100` generations, `$0.5` budget, `1` island, prompt evolution enabled |
-| `shinka_medium.yaml` | moderate parallel run | async `5/5/4` workers, `100` generations, `$0.1` budget, `2` islands |
-| `shinka_long.yaml` | long/high-throughput run | async `20/20/8` workers, `400` generations, `$2.0` budget, `2` islands |
+| `shinka_medium.yaml` | moderate parallel run | async `5/7/4` workers, adaptive proposal oversubscription, `100` generations, `$2.5` budget |
+| `shinka_long.yaml` | long/high-throughput run | async `20/26/8` workers, adaptive proposal oversubscription, `100` generations, `$5.0` budget |
 
 Notes:
 
-- Top-level `max_evaluation_jobs`, `max_proposal_jobs`, `max_db_workers` are consumed by `run_evo_async.py`.
-- `run_evo.py` ignores those top-level async worker keys.
+- Top-level `max_evaluation_jobs`, `max_proposal_jobs`, `max_db_workers` are consumed by `run_evo.py`.
+- To emulate old sync proposal behavior, set `max_proposal_jobs: 1`.
+- `shinka_medium.yaml` and `shinka_long.yaml` now enable bounded adaptive
+  oversubscription. This is useful for circle packing because proposal
+  generation is often slower than evaluation, so small proposal backlogs help
+  keep evaluation workers busy.
 
 ## Execution Setups
 
@@ -33,17 +36,11 @@ From repo root:
 cd examples/circle_packing
 ```
 
-Async evolution (recommended):
-
-```bash
-python run_evo_async.py --config_path shinka_small.yaml
-# swap config_path to shinka_medium.yaml or shinka_long.yaml as needed
-```
-
-Sync evolution:
+Async evolution:
 
 ```bash
 python run_evo.py --config_path shinka_small.yaml
+# swap config_path to shinka_medium.yaml or shinka_long.yaml as needed
 ```
 
 Single-program evaluation (no evolution loop):

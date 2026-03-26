@@ -15,6 +15,7 @@ from .islands import CombinedIslandManager
 from .island_sampler import create_island_sampler, IslandSampler
 from .display import DatabaseDisplay
 from shinka.embed import EmbeddingClient
+from shinka.defaults import default_archive_criteria
 
 logger = logging.getLogger(__name__)
 
@@ -51,17 +52,17 @@ def clean_nan_values(obj: Any) -> Any:
 @dataclass
 class DatabaseConfig:
     db_path: Optional[str] = None  # Path to SQLite database file
-    num_islands: int = 4
-    archive_size: int = 100
+    num_islands: int = 2
+    archive_size: int = 40
 
     # Inspiration parameters
     elite_selection_ratio: float = 0.3  # Prop of elites inspirations
-    num_archive_inspirations: int = 5  # No. inspiration programs
-    num_top_k_inspirations: int = 2  # No. top-k inspiration programs
+    num_archive_inspirations: int = 1  # No. inspiration programs
+    num_top_k_inspirations: int = 1  # No. top-k inspiration programs
 
     # Island model/migration parameters
     migration_interval: int = 10  # Migrate every N generations
-    migration_rate: float = 0.1  # Prop. of island pop. to migrate
+    migration_rate: float = 0.0  # Prop. of island pop. to migrate
     island_elitism: bool = True  # Keep best prog on their islands
     enforce_island_separation: bool = (
         True  # Enforce full island separation for inspirations
@@ -78,7 +79,7 @@ class DatabaseConfig:
 
     # Parent selection parameters
     parent_selection_strategy: str = (
-        "power_law"  # "weighted"/"power_law" / "beam_search"
+        "weighted"  # "weighted"/"power_law" / "beam_search"
     )
 
     # Power-law parent selection parameters
@@ -97,11 +98,7 @@ class DatabaseConfig:
     #   Positive weight = higher is better (e.g., combined_score)
     #   Negative weight = lower is better (e.g., loc, complexity)
     # Weights represent relative importance after rank normalization
-    archive_criteria: Dict[str, float] = field(
-        default_factory=lambda: {
-            "combined_score": 1.0,  # Primary: maximize fitness
-        }
-    )
+    archive_criteria: Dict[str, float] = field(default_factory=default_archive_criteria)
 
 
 def db_retry(max_retries=5, initial_delay=0.1, backoff_factor=2):
@@ -283,6 +280,7 @@ class ProgramDatabase:
         self.conn: Optional[sqlite3.Connection] = None
         self.cursor: Optional[sqlite3.Cursor] = None
         self.read_only = read_only
+        self.display_console: Optional[Any] = None
 
         # Lazy-init embedding client to avoid requiring API credentials for
         # database-only operations and tests that do not compute embeddings.
@@ -525,6 +523,33 @@ class ProgramDatabase:
         except sqlite3.Error as e:
             logger.error(f"Error during system_prompt_id migration: {e}")
 
+        # Migration 3: Restore legacy compute_time semantics when detailed
+        # pipeline timing is present. compute_time should mirror evaluation
+        # runtime, while pipeline_seconds stores end-to-end wall time.
+        try:
+            self.cursor.execute(
+                """
+                UPDATE programs
+                SET metadata = json_set(
+                    metadata,
+                    '$.compute_time',
+                    json_extract(metadata, '$.evaluation_seconds')
+                )
+                WHERE json_valid(metadata)
+                  AND json_type(metadata, '$.evaluation_seconds') IN ('real', 'integer')
+                  AND (
+                      json_type(metadata, '$.compute_time') IS NULL
+                      OR ABS(
+                          COALESCE(json_extract(metadata, '$.compute_time'), 0.0) -
+                          COALESCE(json_extract(metadata, '$.evaluation_seconds'), 0.0)
+                      ) > 1e-9
+                  )
+                """
+            )
+            self.conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Error during compute_time timing migration: {e}")
+
     @db_retry()
     def _load_metadata_from_db(self):
         if not self.cursor:
@@ -602,6 +627,23 @@ class ProgramDatabase:
             return 0
         self.cursor.execute("SELECT COUNT(*) FROM programs")
         return (self.cursor.fetchone() or {"COUNT(*)": 0})["COUNT(*)"]
+
+    @db_retry()
+    def has_program_with_source_job_id(self, source_job_id: str) -> bool:
+        """Return True if a program row already exists for the given job id."""
+        if not self.cursor:
+            return False
+        self.cursor.execute(
+            """
+            SELECT 1
+            FROM programs
+            WHERE json_valid(metadata)
+              AND json_extract(metadata, '$.source_job_id') = ?
+            LIMIT 1
+            """,
+            (source_job_id,),
+        )
+        return self.cursor.fetchone() is not None
 
     @db_retry()
     def add(self, program: Program, verbose: bool = False) -> str:
@@ -1303,6 +1345,7 @@ class ProgramDatabase:
                 island_manager=self.island_manager,
                 count_programs_func=self._count_programs_in_db,
                 get_best_program_func=self.get_best_program,
+                default_console=self.display_console,
             )
 
         self._database_display.print_sampling_summary(
@@ -1316,6 +1359,7 @@ class ProgramDatabase:
             max_resample_attempts,
             ancestor_inspirations,
             is_fix_mode,
+            console=self.display_console,
         )
 
     @db_retry()
@@ -2154,9 +2198,12 @@ class ProgramDatabase:
                 island_manager=self.island_manager,
                 count_programs_func=self._count_programs_in_db,
                 get_best_program_func=self.get_best_program,
+                default_console=self.display_console,
             )
             self._database_display.set_last_iteration(self.last_iteration)
 
+        if hasattr(self._database_display, "set_default_console"):
+            self._database_display.set_default_console(self.display_console)
         self._database_display.print_summary(console)
 
     def _print_program_summary(self, program) -> None:
@@ -2169,9 +2216,22 @@ class ProgramDatabase:
                 island_manager=self.island_manager,
                 count_programs_func=self._count_programs_in_db,
                 get_best_program_func=self.get_best_program,
+                default_console=self.display_console,
             )
 
-        self._database_display.print_program_summary(program)
+        if hasattr(self._database_display, "set_default_console"):
+            self._database_display.set_default_console(self.display_console)
+        self._database_display.print_program_summary(
+            program, console=self.display_console
+        )
+
+    def set_display_console(self, console: Optional[Any]) -> None:
+        """Set shared console used for rich DB summaries."""
+        self.display_console = console
+        if hasattr(self, "_database_display") and hasattr(
+            self._database_display, "set_default_console"
+        ):
+            self._database_display.set_default_console(console)
 
     def check_scheduled_operations(self):
         """Run any operations that were scheduled during add but deferred for performance."""

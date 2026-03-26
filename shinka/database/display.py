@@ -1,7 +1,6 @@
 import json
 import logging
 import time
-import numpy as np
 from typing import Optional, Callable, Any
 import rich.box  # type: ignore
 import rich  # type: ignore
@@ -23,6 +22,7 @@ class DatabaseDisplay:
         island_manager,
         count_programs_func: Callable[[], int],
         get_best_program_func: Callable[[], Optional[Any]],
+        default_console: Optional[RichConsole] = None,
     ):
         self.cursor = cursor
         self.conn = conn
@@ -30,10 +30,15 @@ class DatabaseDisplay:
         self.island_manager = island_manager
         self.count_programs_func = count_programs_func
         self.get_best_program_func = get_best_program_func
+        self.default_console = default_console
+
+    def set_default_console(self, console: Optional[RichConsole]) -> None:
+        """Set default console used by all rich display methods."""
+        self.default_console = console
 
     def print_program_summary(self, program, console: Optional[RichConsole] = None):
         """Print a rich summary of a newly added program in two rows."""
-        _console = console or RichConsole()
+        _console = console or self.default_console or RichConsole()
 
         # Get the best program's score
         best_program_overall = self.get_best_program_func()
@@ -133,8 +138,13 @@ class DatabaseDisplay:
 
         # Format time
         time_display = "[dim]N/A[/dim]"
-        if program.metadata and "compute_time" in program.metadata:
-            time_val = program.metadata["compute_time"]
+        if program.metadata:
+            time_val = program.metadata.get(
+                "compute_time", program.metadata.get("pipeline_seconds")
+            )
+        else:
+            time_val = None
+        if time_val is not None:
             if time_val > 60:
                 time_display = f"{time_val / 60:.1f}m"
             else:
@@ -163,7 +173,7 @@ class DatabaseDisplay:
             logger.error("Database not connected. Cannot print summary.")
             return
 
-        _console = console or RichConsole()
+        _console = console or self.default_console or RichConsole()
 
         # Calculate total cost, scores, etc. from metadata of all programs
         total_api_cost = 0
@@ -191,6 +201,8 @@ class DatabaseDisplay:
                         total_meta_cost += float(metadata["meta_cost"])
                     if "compute_time" in metadata:
                         total_compute_time += float(metadata["compute_time"])
+                    elif "pipeline_seconds" in metadata:
+                        total_compute_time += float(metadata["pipeline_seconds"])
 
                 if row["combined_score"] is not None:
                     score = float(row["combined_score"])
@@ -200,8 +212,6 @@ class DatabaseDisplay:
                         best_score = score
                     num_with_scores += 1
                     all_scores.append(score)
-        median_score = np.median(all_scores)
-
         # Table 1: Summary Table
         summary_table = RichTable(
             title="[bold cyan]Program Database Summary[/bold cyan]",
@@ -491,9 +501,10 @@ class DatabaseDisplay:
         max_resample_attempts=None,
         ancestor_inspirations=None,
         is_fix_mode=False,
+        console: Optional[RichConsole] = None,
     ):
         """Print a summary of the sampled parent and inspirations."""
-        console = RichConsole()
+        _console = console or self.default_console or RichConsole()
 
         # Determine generation to display - use provided target_generation or fallback
         if target_generation is not None:
@@ -609,8 +620,12 @@ class DatabaseDisplay:
 
             # Time
             time_display = "[dim]N/A[/dim]"
-            if prog.metadata and "compute_time" in prog.metadata:
-                time_val = prog.metadata["compute_time"]
+            time_val = None
+            if prog.metadata:
+                time_val = prog.metadata.get(
+                    "compute_time", prog.metadata.get("pipeline_seconds")
+                )
+            if time_val is not None:
                 if time_val > 60:
                     time_display = f"{time_val / 60:.1f}m"
                 else:
@@ -652,4 +667,4 @@ class DatabaseDisplay:
         for i, prog in enumerate(top_k_inspirations):
             table.add_row(*format_program_row(prog, f"TopK-{i + 1}"))
 
-        console.print(table)
+        _console.print(table)
