@@ -1,6 +1,8 @@
-# Shinka Configuration Guide ⚙️
+# Configuration Guide
 
 This document is synced to the current code + config files in this repo.
+
+---
 
 ## Default Layers (Source of Truth)
 
@@ -14,6 +16,8 @@ Configuration values are resolved in this order (later wins):
 3. Task/cluster/variant overrides from Hydra composition
 4. CLI overrides (`shinka_launch ... key=value`, or `shinka_run --set ...`)
 5. Authoritative `shinka_run` flags (`--results_dir`, `--num_generations`)
+
+---
 
 ## Runtime Config Objects
 
@@ -40,16 +44,28 @@ Concurrency is configured on `ShinkaEvolveRunner`, not on `EvolutionConfig`.
 | `meta_llm_kwargs` | `dict` | `{}` | kwargs for meta-recommendation LLM calls. |
 | `meta_max_recommendations` | `int` | `5` | Max recommendations produced per meta step. |
 | `sample_single_meta_rec` | `bool` | `True` | Whether to sample one recommendation when multiple exist. |
-| `embedding_model` | `Optional[str]` | `'text-embedding-3-small'` | Embedding model for code similarity. Also supports `local/<model>@http(s)://host[:port]/v1` for local OpenAI-compatible embedding endpoints. |
+| `embedding_model` | `Optional[str]` | `'text-embedding-3-small'` | Embedding model for code similarity. Also supports `local/<model>@http(s)://host[:port]/v1` for local OpenAI-compatible embedding endpoints, with optional `?api_key_env=ENV_VAR` for per-model credentials. |
 | `init_program_path` | `Optional[str]` | `'initial.py'` | Initial program path. |
 | `results_dir` | `Optional[str]` | `None` | Results directory; auto-assigned when `None`. |
+| `enable_wandb_logging` | `bool` | `False` | Mirror evolution metrics to W&B. Existing SQLite and WebUI logging remains enabled. Install the `wandb` extra first. |
+| `wandb_project` | `Optional[str]` | `'shinka-evolve'` | W&B project used when wandb logging is enabled. |
+| `wandb_entity` | `Optional[str]` | `None` | Optional W&B entity/team. |
+| `wandb_group` | `Optional[str]` | `None` | Optional W&B run group. |
+| `wandb_name` | `Optional[str]` | `None` | Optional W&B run name; defaults to the results directory name. |
+| `wandb_mode` | `Optional[str]` | `None` | Optional W&B mode, e.g. `offline` or `disabled`. |
+| `wandb_tags` | `List[str]` | `[]` | Optional W&B tags. |
+| `wandb_notes` | `Optional[str]` | `None` | Optional W&B run notes. |
+| `wandb_dir` | `Optional[str]` | `None` | Optional local W&B directory; defaults to `results_dir`. |
+| `wandb_run_id` | `Optional[str]` | `None` | Optional W&B run ID; otherwise generated and persisted in the results directory. |
+| `wandb_resume` | `str` | `'allow'` | W&B resume policy used with the persisted run ID. |
+| `wandb_config` | `Dict[str, Any]` | `{}` | Extra W&B config values merged into the run config. |
 | `max_novelty_attempts` | `int` | `3` | Max novelty loops per generation. |
 | `code_embed_sim_threshold` | `float` | `0.99` | Similarity threshold used by novelty checks. |
 | `novelty_llm_models` | `Optional[List[str]]` | `None` | Optional novelty-judge model pool. |
 | `novelty_llm_kwargs` | `dict` | `{}` | kwargs for novelty-judge LLM calls. |
 | `use_text_feedback` | `bool` | `False` | Include text feedback in mutation prompts. |
 | `max_api_costs` | `Optional[float]` | `None` | API budget cap in USD; stops new submissions at cap. |
-| `enable_controlled_oversubscription` | `bool` | `True` | Enable bounded proposal oversubscription when proposal generation is slower than evaluation. |
+| `enable_controlled_oversubscription` | `bool` | `False` | Enable bounded proposal oversubscription when proposal generation is slower than evaluation. |
 | `proposal_target_mode` | `str` | `'adaptive'` | Proposal target controller mode: `adaptive` or `fixed`. |
 | `proposal_target_min_samples` | `int` | `5` | Minimum completed timing samples required before adaptive targeting activates. |
 | `proposal_target_ratio_cap` | `float` | `2.0` | Maximum sampling/evaluation ratio used by the adaptive controller. |
@@ -68,6 +84,47 @@ Concurrency is configured on `ShinkaEvolveRunner`, not on `EvolutionConfig`.
 | `prompt_epsilon` | `float` | `0.1` | Epsilon-greedy exploration for prompt sampler. |
 | `prompt_evo_top_k_programs` | `int` | `3` | Number of top programs used during prompt evolution. |
 | `prompt_percentile_recompute_interval` | `int` | `20` | Generations between prompt percentile recomputations. |
+
+W&B logging examples:
+
+```bash
+# Install the optional integration.
+pip install 'shinka-evolve[wandb]'
+
+# Authenticate online runs. In CI, provide this through a secret manager.
+export WANDB_API_KEY=<your-api-key>
+
+# Add W&B metrics and a compact final table alongside the WebUI database.
+shinka_run --task-dir examples/circle_packing --results_dir results/circle_wandb --num_generations 20 \
+  --set evo.enable_wandb_logging=true \
+  --set evo.wandb_project=shinka-evolve
+```
+
+Population and island snapshots use the monotonic
+`population/evaluated_count` axis. They include counts, correctness, scores,
+cumulative `cost/*`, and cumulative `timing/*_total`. Raw evaluated candidates
+use `score/individual` and `individual/*` fields without binding those events to
+generation. Administrative island copies remain in population/table counts but
+are excluded from evaluated count, candidate history, and costs. The compact
+`population/final_table` omits program code, embeddings, and unrestricted
+metadata. When a results directory is resumed, its `.wandb_run_id` is reused
+with `wandb_resume='allow'` by default. Online mode uses credentials from
+`wandb login` or `WANDB_API_KEY`; set `wandb_mode=offline` to record locally
+without uploading. W&B failures are non-fatal and do not alter the existing
+database or WebUI path.
+
+The integration disables W&B console, Git, code, requirements, machine, and
+system-stat capture. Its run config contains only an explicit allowlist of safe
+scalar experiment settings; `wandb_config` remains an explicit extension and is
+recursively redacted for secret-like keys. Arbitrary `wandb_config` values cross
+the upload boundary when their keys are not recognized as sensitive, so do not
+put secrets or private data there. Candidate events omit private metrics and
+include at most 64 public numeric metrics whose full keys are at most 128
+characters; secret-like keys are discarded. Population snapshots use a compact
+database aggregate on a dedicated serialized telemetry worker, run at most once
+every five seconds, and overlapping refresh requests are coalesced. If the
+bounded raw-candidate queue saturates, the newest candidate event is dropped
+with a rate-limited warning; population and final snapshots remain authoritative.
 
 ### DatabaseConfig (`shinka.database.DatabaseConfig`)
 
@@ -141,7 +198,9 @@ Concurrency is configured on `ShinkaEvolveRunner`, not on `EvolutionConfig`.
 
 `conda_env` and `activate_script` are mutually exclusive.
 
-## Hydra Presets In `shinka/configs/`
+---
+
+## Hydra Presets
 
 ### Evolution Presets
 
@@ -151,8 +210,8 @@ All `shinka/configs/evolution/*.yaml` set runner-level concurrency at the top le
 
 ```yaml
 max_evaluation_jobs: 1
-max_proposal_jobs: 1
-max_db_workers: 4
+max_proposal_jobs: 2
+max_db_workers: 2
 
 evo_config:
   patch_types: ["diff", "full"]
@@ -162,15 +221,16 @@ evo_config:
   llm_models: ["gpt-4.1"]
   llm_dynamic_selection: null
   embedding_model: "text-embedding-3-small"
+  enable_controlled_oversubscription: false
   results_dir: ${output_dir}
 ```
 
 #### `shinka/configs/evolution/medium_budget.yaml`
 
 ```yaml
-max_evaluation_jobs: 2
-max_proposal_jobs: 3
-max_db_workers: 4
+max_evaluation_jobs: 4
+max_proposal_jobs: 6
+max_db_workers: 2
 
 evo_config:
   patch_types: ["diff", "full", "cross"]
@@ -192,7 +252,7 @@ evo_config:
   meta_rec_interval: 10
   embedding_model: "text-embedding-3-small"
   code_embed_sim_threshold: 0.99
-  enable_controlled_oversubscription: true
+  enable_controlled_oversubscription: false
   proposal_target_mode: adaptive
   proposal_target_min_samples: 5
   proposal_target_ratio_cap: 2.0
@@ -206,7 +266,7 @@ evo_config:
 ```yaml
 max_evaluation_jobs: 6
 max_proposal_jobs: 8
-max_db_workers: 4
+max_db_workers: 2
 
 evo_config:
   patch_types: ["diff", "full", "cross"]
@@ -218,7 +278,7 @@ evo_config:
     - "gpt-4.1"
     - "gpt-4.1-mini"
     - "gpt-4.1-nano"
-    - "us.anthropic.claude-sonnet-4-20250514-v1:0"
+    - "us.anthropic.claude-sonnet-4-6-v1:0"
     - "o4-mini"
   llm_dynamic_selection: ucb
   llm_kwargs:
@@ -229,7 +289,7 @@ evo_config:
   meta_llm_kwargs:
     temperatures: [0.0]
   embedding_model: "text-embedding-3-small"
-  enable_controlled_oversubscription: true
+  enable_controlled_oversubscription: false
   proposal_target_mode: adaptive
   proposal_target_min_samples: 5
   proposal_target_ratio_cap: 2.0
@@ -257,7 +317,7 @@ Recommended starting point:
 ```yaml
 max_evaluation_jobs: 5
 max_proposal_jobs: 7
-max_db_workers: 4
+max_db_workers: 2
 
 evo_config:
   enable_controlled_oversubscription: true
@@ -350,6 +410,8 @@ Only these task files currently exist:
 
 Both define task-specific `evaluate_function`, `distributed_job_config`, and `evo_config` task prompt/init path.
 
+---
+
 ## Current Hydra Composition Defaults
 
 `shinka/configs/config.yaml` defaults chain:
@@ -368,6 +430,8 @@ So default `shinka_launch` behavior is a neutral medium shared baseline on the
 `circle_packing` task with `variant=default`. Example-heavy stacks remain
 available via explicit variants such as `variant=circle_packing_example`.
 
+---
+
 ## `shinka_run` Config File Schema
 
 `shinka_run --config-fname <yaml>` accepts:
@@ -384,7 +448,9 @@ Precedence for `shinka_run`:
    - `--results_dir` always sets `evo.results_dir`
    - `--num_generations` always sets `evo.num_generations`
 
-## Current Config Directory Structure
+---
+
+## Config Directory Structure
 
 ```text
 shinka/configs/
@@ -409,6 +475,8 @@ shinka/configs/
     ├── default.yaml
     └── novelty_generator_example.yaml
 ```
+
+---
 
 ## Quick Valid Overrides
 

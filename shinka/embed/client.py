@@ -1,20 +1,26 @@
 from dataclasses import dataclass
 import os
-import re
 from typing import Any, Optional, Tuple
-from urllib.parse import urlparse
 
-from google import genai
 import openai
 
+from shinka.azure_openai_config import (
+    azure_api_version,
+    azure_openai_api_key,
+    azure_resource_endpoint,
+)
 from shinka.env import load_shinka_dotenv
+from shinka.google_genai import _google_genai_timeout_ms, build_google_genai_client
+from shinka.local_openai_config import (
+    parse_local_openai_model,
+    resolve_local_openai_api_key,
+)
 
 from .providers.pricing import get_provider
 
 load_shinka_dotenv()
 
 TIMEOUT = 600
-_LOCAL_MODEL_PATTERN = re.compile(r"^local/(?P<model>[^@]+)@(?P<url>https?://.+)$")
 _OPENROUTER_PREFIX = "openrouter/"
 
 
@@ -24,6 +30,7 @@ class ResolvedEmbeddingModel:
     api_model_name: str
     provider: str
     base_url: Optional[str] = None
+    api_key_env_name: Optional[str] = None
 
 
 def resolve_embedding_backend(model_name: str) -> ResolvedEmbeddingModel:
@@ -57,25 +64,19 @@ def resolve_embedding_backend(model_name: str) -> ResolvedEmbeddingModel:
             base_url=None,
         )
 
-    local_match = _LOCAL_MODEL_PATTERN.match(model_name)
+    local_match = parse_local_openai_model(model_name)
     if local_match:
-        api_model_name = local_match.group("model")
-        base_url = local_match.group("url")
-        parsed = urlparse(base_url)
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ValueError(
-                f"Invalid local model URL '{base_url}'. Expected http(s)://host[:port]/..."
-            )
         return ResolvedEmbeddingModel(
             original_model_name=model_name,
-            api_model_name=api_model_name,
+            api_model_name=local_match.api_model_name,
             provider="local_openai",
-            base_url=base_url,
+            base_url=local_match.base_url,
+            api_key_env_name=local_match.api_key_env_name,
         )
 
     raise ValueError(
         f"Embedding model {model_name} not supported. "
-        "Use a known pricing.csv model, 'openrouter/<model>', "
+        "Use a model from the refreshed pricing catalog, 'openrouter/<model>', "
         "or 'local/<model>@http(s)://host[:port]/v1'."
     )
 
@@ -89,13 +90,13 @@ def get_client_embed(model_name: str) -> Tuple[Any, str]:
         client = openai.OpenAI(timeout=TIMEOUT)
     elif provider == "azure":
         client = openai.AzureOpenAI(
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            api_version=os.getenv("AZURE_API_VERSION"),
-            azure_endpoint=os.getenv("AZURE_API_ENDPOINT"),
+            api_key=azure_openai_api_key(),
+            api_version=azure_api_version(),
+            azure_endpoint=azure_resource_endpoint(),
             timeout=TIMEOUT,
         )
     elif provider == "google":
-        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        client = build_google_genai_client(timeout_ms=_google_genai_timeout_ms(TIMEOUT))
     elif provider == "openrouter":
         client = openai.OpenAI(
             api_key=os.environ["OPENROUTER_API_KEY"],
@@ -104,7 +105,7 @@ def get_client_embed(model_name: str) -> Tuple[Any, str]:
         )
     elif provider == "local_openai":
         client = openai.OpenAI(
-            api_key=os.getenv("LOCAL_OPENAI_API_KEY", "local"),
+            api_key=resolve_local_openai_api_key(resolved.api_key_env_name),
             base_url=resolved.base_url,
             timeout=TIMEOUT,
         )
@@ -123,13 +124,13 @@ def get_async_client_embed(model_name: str) -> Tuple[Any, str]:
         client = openai.AsyncOpenAI()
     elif provider == "azure":
         client = openai.AsyncAzureOpenAI(
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            api_version=os.getenv("AZURE_API_VERSION"),
-            azure_endpoint=os.getenv("AZURE_API_ENDPOINT"),
+            api_key=azure_openai_api_key(),
+            api_version=azure_api_version(),
+            azure_endpoint=azure_resource_endpoint(),
         )
     elif provider == "google":
         # Gemini doesn't have async client yet, will use thread pool in embedding.py
-        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+        client = build_google_genai_client(timeout_ms=_google_genai_timeout_ms(TIMEOUT))
     elif provider == "openrouter":
         client = openai.AsyncOpenAI(
             api_key=os.environ["OPENROUTER_API_KEY"],
@@ -138,7 +139,7 @@ def get_async_client_embed(model_name: str) -> Tuple[Any, str]:
         )
     elif provider == "local_openai":
         client = openai.AsyncOpenAI(
-            api_key=os.getenv("LOCAL_OPENAI_API_KEY", "local"),
+            api_key=resolve_local_openai_api_key(resolved.api_key_env_name),
             base_url=resolved.base_url,
             timeout=TIMEOUT,
         )

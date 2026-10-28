@@ -53,6 +53,7 @@ def test_project_metadata_targets_pypi_release():
     assert project["license"] == "Apache-2.0"
     assert project["scripts"] == {
         "shinka_launch": "shinka.cli.launch:main",
+        "shinka_models": "shinka.cli.models:main",
         "shinka_run": "shinka.cli.run:main",
         "shinka_visualize": "shinka.webui.visualization:main",
     }
@@ -65,6 +66,7 @@ def test_project_metadata_targets_pypi_release():
             "configs/*.yaml",
             "configs/*/*.yaml",
             "favicon.png",
+            "tools/pricing/*.json",
             "embed/providers/*.csv",
             "llm/providers/*.csv",
             "webui/*.html",
@@ -72,6 +74,18 @@ def test_project_metadata_targets_pypi_release():
             "webui/*.jpg",
         ]
     }
+
+
+def test_httpx_dependency_allows_compatible_updates() -> None:
+    dependencies = _read_pyproject()["project"]["dependencies"]
+
+    assert "httpx>=0.27" in dependencies
+
+
+def test_google_genai_dependency_supports_thinking_levels() -> None:
+    dependencies = _read_pyproject()["project"]["dependencies"]
+
+    assert "google-genai>=2.13,<3" in dependencies
 
 
 def test_readme_documents_package_install():
@@ -87,7 +101,7 @@ def test_readme_documents_package_install():
 def test_changelog_tracks_current_package_version():
     changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
 
-    assert shinka.__version__ == "0.0.2"
+    assert shinka.__version__ == "0.0.7"
     assert "# Changelog" in changelog
     assert f"## {shinka.__version__} -" in changelog
 

@@ -22,6 +22,12 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
 
+      - name: Set up stable Rust formatter
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+          rustfmt --version
+
       - name: Install project
         run: uv sync --dev
 
@@ -32,7 +38,7 @@ jobs:
         run: uv run mypy --follow-imports=skip --ignore-missing-imports tests/test_*.py tests/conftest.py
 
       - name: Pytest + Coverage
-        run: uv run --with pytest-cov pytest -q -m "not requires_secrets" --cov=shinka --cov-report=term-missing --cov-report=xml:coverage.xml
+        run: uv run --with pytest-cov pytest -q -m "not requires_secrets and not models_dev_live" --cov=shinka --cov-report=term-missing --cov-report=xml:coverage.xml
 
       - name: Upload Coverage XML
         uses: actions/upload-artifact@v4

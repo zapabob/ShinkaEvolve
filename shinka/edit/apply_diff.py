@@ -5,6 +5,7 @@ import logging
 from typing import Union, Optional, List, Tuple
 
 from shinka.utils.languages import get_language_extension
+from .marker_validation import validate_evolve_markers
 
 logger = logging.getLogger(__name__)
 
@@ -14,8 +15,12 @@ PATCH_PATTERN = re.compile(
 )
 
 
-EVOLVE_START = re.compile(r"(?:#|//|)?\s*EVOLVE-BLOCK-START")
-EVOLVE_END = re.compile(r"(?:#|//|)?\s*EVOLVE-BLOCK-END")
+EVOLVE_START = re.compile(
+    r"(?:#|//|!|<!--|\(\*)?[^\S\r\n]*EVOLVE-BLOCK-START[^\S\r\n]*(?:-->|\*\))?"
+)
+EVOLVE_END = re.compile(
+    r"(?:#|//|!|<!--|\(\*)?[^\S\r\n]*EVOLVE-BLOCK-END[^\S\r\n]*(?:-->|\*\))?"
+)
 
 
 def _mutable_ranges(text: str) -> list[tuple[int, int]]:
@@ -140,11 +145,15 @@ def _clean_evolve_markers(text: str) -> str:
     patterns_to_remove = [
         r"^\s*#\s*EVOLVE-BLOCK-START\s*$",  # Python style
         r"^\s*//\s*EVOLVE-BLOCK-START\s*$",  # C/C++/CUDA style
+        r"^\s*!\s*EVOLVE-BLOCK-START\s*$",  # Fortran style
         r"^\s*<!--\s*EVOLVE-BLOCK-START\s*-->\s*$",  # HTML/Markdown style
+        r"^\s*\(\*\s*EVOLVE-BLOCK-START\s*\*\)\s*$",  # Wolfram style
         r"^\s*EVOLVE-BLOCK-START\s*$",  # Plain text
         r"^\s*#\s*EVOLVE-BLOCK-END\s*$",  # Python style
         r"^\s*//\s*EVOLVE-BLOCK-END\s*$",  # C/C++/CUDA
+        r"^\s*!\s*EVOLVE-BLOCK-END\s*$",  # Fortran style
         r"^\s*<!--\s*EVOLVE-BLOCK-END\s*-->\s*$",  # HTML/Markdown style
+        r"^\s*\(\*\s*EVOLVE-BLOCK-END\s*\*\)\s*$",  # Wolfram style
         r"^\s*EVOLVE-BLOCK-END\s*$",  # Plain text
     ]
 
@@ -613,8 +622,36 @@ def apply_search_replace(
             if not mutable:
                 msg = _create_no_evolve_block_error(new_text, "insertion")
                 raise PatchError(msg)
+            if not replace:
+                # Empty payload: keep the historical content no-op.
+                num_applied += 1
+                continue
             a, b = mutable[-1]
-            new_text = new_text[:b] + replace + new_text[b:]
+            # `b` points at the END marker itself and `replace` has no
+            # trailing newline (stripped above), so splicing at `b` would
+            # glue the marker onto the payload's last line. When the marker
+            # sits on its own (possibly indented) line, insert at the start
+            # of that line; when code precedes the marker on the same line,
+            # append after that code and move the marker to its own line.
+            line_start = new_text.rfind("\n", 0, b) + 1
+            marker_line_prefix = new_text[line_start:b]
+            if marker_line_prefix.strip():
+                leading_whitespace = marker_line_prefix[
+                    : len(marker_line_prefix) - len(marker_line_prefix.lstrip())
+                ]
+                new_text = (
+                    new_text[:line_start]
+                    + marker_line_prefix.rstrip()
+                    + "\n"
+                    + replace
+                    + "\n"
+                    + leading_whitespace
+                    + new_text[b:]
+                )
+            else:
+                new_text = (
+                    new_text[:line_start] + replace + "\n" + new_text[line_start:]
+                )
             num_applied += 1
             continue
 
@@ -737,6 +774,17 @@ def apply_diff_patch(
         error_message = str(e)
         # Return original content, 0 applied, no output path, error msg
         return updated_content, 0, None, error_message, None, None
+
+    # Validate the assembled file's EVOLVE-BLOCK markers. This is normally a
+    # no-op for diff patches because the markers come from the original seed
+    # and the SEARCH/REPLACE blocks operate strictly inside them — but a
+    # malformed patch that injects bad comment delimiters around the markers
+    # would otherwise reach the evaluator silently. See marker_validation.py.
+    marker_err = validate_evolve_markers(updated_content, language)
+    if marker_err is not None:
+        if verbose:
+            logger.info(f"Rejecting diff patch: {marker_err}")
+        return original, 0, None, marker_err, None, None
 
     suffix = f".{get_language_extension(language)}"
 

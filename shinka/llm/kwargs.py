@@ -1,4 +1,4 @@
-from typing import List, Union, Optional
+from typing import Any, List, Union, Optional
 import random
 from .providers.pricing import (
     is_reasoning_model,
@@ -6,6 +6,10 @@ from .providers.pricing import (
     requires_reasoning,
 )
 from .providers.model_resolver import resolve_model_backend
+from .constants import (
+    GEMINI_THINKING_LEVEL_BY_EFFORT,
+    GEMINI_THINKING_LEVEL_MODELS,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -16,6 +20,14 @@ THINKING_TOKENS = {
     "medium": 4096,
     "high": 8192,
     "max": 16384,
+}
+
+NO_TEMPERATURE_MODELS = {
+    "claude-opus-4-8",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    *GEMINI_THINKING_LEVEL_MODELS,
+    "us.anthropic.claude-opus-4-8",
 }
 
 
@@ -29,7 +41,7 @@ def sample_batch_kwargs(
     unique_filter: bool = False,
 ):
     """Sample a dictionary of kwargs for a given model."""
-    all_kwargs = []
+    all_kwargs: list[dict[str, Any]] = []
     attempts = 0
     max_attempts = num_samples * 10  # Prevent infinite loops
 
@@ -78,7 +90,7 @@ def sample_model_kwargs(
     if isinstance(reasoning_efforts, str):
         reasoning_efforts = [reasoning_efforts]
 
-    kwargs_dict = {}
+    kwargs_dict: dict[str, Any] = {}
 
     # 1. SAMPLE: model name
     if model_sample_probs is not None:
@@ -99,27 +111,38 @@ def sample_model_kwargs(
     api_model_name = resolved_model.api_model_name
     provider = resolved_model.provider
 
+    if provider == "headless":
+        return kwargs_dict
+
     # 2. SAMPLE: reasoning effort
-    if is_reasoning_model(api_model_name):
+    if is_reasoning_model(model_name):
         r_effort = random.choice(reasoning_efforts)
     else:
         r_effort = "disabled"
 
     # Some opennrouter models only support running with reasoning effort
-    if requires_reasoning(api_model_name) and r_effort == "disabled":
+    if requires_reasoning(model_name) and r_effort == "disabled":
         r_effort = "low"
 
     # 3. SAMPLE: temperature with possible reasoning restrictions
-    if has_fixed_temperature(api_model_name) and (
-        r_effort != "disabled" or provider in ("openai", "openrouter", "azure_openai")
+    include_temperature = api_model_name not in NO_TEMPERATURE_MODELS and not (
+        provider in ("openai", "azure_openai") and is_reasoning_model(model_name)
+    )
+    if (
+        include_temperature
+        and has_fixed_temperature(model_name)
+        and (
+            r_effort != "disabled"
+            or provider in ("openai", "openrouter", "azure_openai")
+        )
     ):
         kwargs_dict["temperature"] = 1.0
-    else:
+    elif include_temperature:
         kwargs_dict["temperature"] = random.choice(temperatures)
 
     # 4.a) SET: max_output_tokens for OpenAI reasoning effort
     if provider in ("openai", "openrouter", "azure_openai") and is_reasoning_model(
-        api_model_name
+        model_name
     ):
         kwargs_dict["max_output_tokens"] = random.choice(max_tokens)
         if r_effort == "disabled":
@@ -136,10 +159,14 @@ def sample_model_kwargs(
             kwargs_dict["reasoning"]["summary"] = "auto"
 
     # 4.b) SET: max_tokens for Google reasoning effort
-    elif provider == "google" and is_reasoning_model(api_model_name):
+    elif provider == "google" and is_reasoning_model(model_name):
         kwargs_dict["max_tokens"] = random.choice(max_tokens)
-        think_bool = r_effort != "disabled"
-        if think_bool:
+        if api_model_name in GEMINI_THINKING_LEVEL_MODELS:
+            if r_effort != "disabled":
+                kwargs_dict["thinking_level"] = GEMINI_THINKING_LEVEL_BY_EFFORT[
+                    r_effort
+                ]
+        elif r_effort != "disabled":
             t = THINKING_TOKENS[r_effort]
             thinking_tokens = t if t < kwargs_dict["max_tokens"] else 1024
             kwargs_dict["thinking_budget"] = thinking_tokens
@@ -150,7 +177,7 @@ def sample_model_kwargs(
                 kwargs_dict["thinking_budget"] = 0
 
     # 4.c) SET: max_tokens for Anthropic or Bedrock reasoning effort
-    elif provider in ("anthropic", "bedrock") and is_reasoning_model(api_model_name):
+    elif provider in ("anthropic", "bedrock") and is_reasoning_model(model_name):
         kwargs_dict["max_tokens"] = min(random.choice(max_tokens), 64000)
         think_bool = r_effort != "disabled"
         if think_bool:
@@ -164,7 +191,16 @@ def sample_model_kwargs(
                 "budget_tokens": thinking_tokens,
             }
 
-    # 4.d) SET: max_tokens for all other models
+    # 4.d) SET: max_tokens and thinking mode for DeepSeek reasoning models
+    elif provider == "deepseek" and is_reasoning_model(model_name):
+        kwargs_dict["max_tokens"] = random.choice(max_tokens)
+        if r_effort == "disabled":
+            kwargs_dict["extra_body"] = {"thinking": {"type": "disabled"}}
+        else:
+            kwargs_dict["reasoning_effort"] = "max" if r_effort == "max" else "high"
+            kwargs_dict["extra_body"] = {"thinking": {"type": "enabled"}}
+
+    # 4.e) SET: max_tokens for all other models
     else:
         # Non-reasoning models or other providers
         if provider in ("anthropic", "bedrock", "deepseek", "local_openai"):

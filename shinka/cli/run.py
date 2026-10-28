@@ -17,6 +17,8 @@ from shinka.cli.run_config import load_optional_yaml_config
 SUPPORTED_INITIAL_EXTENSIONS: dict[str, str] = {
     ".py": "python",
     ".jl": "julia",
+    ".go": "go",
+    ".sv": "verilog",
     ".rs": "rust",
     ".swift": "swift",
     ".cpp": "cpp",
@@ -24,10 +26,16 @@ SUPPORTED_INITIAL_EXTENSIONS: dict[str, str] = {
     ".cxx": "cpp",
     ".cu": "cuda",
     ".json": "json",
+    ".f90": "fortran",
+    ".f95": "fortran",
+    ".f03": "fortran",
+    ".f08": "fortran",
 }
 
 INITIAL_EXTENSION_PRIORITY: list[str] = [
     ".py",
+    ".go",
+    ".sv",
     ".jl",
     ".rs",
     ".cpp",
@@ -36,6 +44,10 @@ INITIAL_EXTENSION_PRIORITY: list[str] = [
     ".cu",
     ".swift",
     ".json",
+    ".f90",
+    ".f95",
+    ".f03",
+    ".f08",
 ]
 
 
@@ -44,6 +56,16 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be > 0")
     return parsed
+
+
+def _resolve_runner_bool(
+    cli_value: Optional[bool], runner_config: Dict[str, Any], key: str, default: bool
+) -> bool:
+    if cli_value is not None:
+        return cli_value
+    if key in runner_config:
+        return bool(runner_config[key])
+    return default
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -176,8 +198,9 @@ def _build_parser() -> argparse.ArgumentParser:
     output_group = parser.add_argument_group("output/verbosity")
     output_group.add_argument(
         "--verbose",
-        action="store_true",
-        help="Enable verbose runner logging.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable verbose runner logging (default: enabled; use --no-verbose to disable).",
     )
     output_group.add_argument(
         "--debug",
@@ -397,6 +420,7 @@ def _build_runner(
         "evo_config": evo_config,
         "job_config": job_config,
         "db_config": db_config,
+        "banner_style": "minimal",
         "verbose": args.verbose,
         "debug": args.debug,
         "init_program_str": init_program_str,
@@ -454,7 +478,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             args.max_proposal_jobs = runner_config.get("max_proposal_jobs")
         if args.max_db_workers is None:
             args.max_db_workers = runner_config.get("max_db_workers")
-        args.verbose = args.verbose or bool(runner_config.get("verbose", False))
+        args.verbose = _resolve_runner_bool(
+            args.verbose, runner_config, "verbose", True
+        )
         args.debug = args.debug or bool(runner_config.get("debug", False))
 
         evo_config = EvolutionConfig(**evo_values)

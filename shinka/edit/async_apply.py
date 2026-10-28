@@ -5,10 +5,17 @@ Provides async versions of patch application and validation.
 
 import asyncio
 import logging
+import shutil
+import tempfile
 from typing import Tuple, Optional
 from pathlib import Path
 from .apply_diff import apply_diff_patch
 from .apply_full import apply_full_patch
+from shinka.utils.languages import normalize_language
+from shinka.utils.wolfram import (
+    build_wolframscript_argv,
+    escape_wolfram_string,
+)
 
 try:
     import aiofiles
@@ -16,6 +23,7 @@ except ImportError:
     aiofiles = None
 
 logger = logging.getLogger(__name__)
+TEXT_ENCODING = "utf-8"
 
 
 async def _run_validation_subprocess(
@@ -24,22 +32,36 @@ async def _run_validation_subprocess(
     """Run a validator subprocess and normalize timeout/error handling."""
     proc = await asyncio.create_subprocess_exec(
         *args,
-        stdout=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
+    communication = asyncio.create_task(proc.communicate())
 
     try:
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        _, stderr = await asyncio.wait_for(
+            asyncio.shield(communication), timeout=timeout
+        )
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        _kill_validation_process(proc)
+        await communication
         return False, f"Validation timeout after {timeout}s"
+    except asyncio.CancelledError:
+        _kill_validation_process(proc)
+        await asyncio.shield(communication)
+        raise
 
     if proc.returncode == 0:
         return True, None
 
     error_msg = stderr.decode() if stderr else "Unknown compilation error"
     return False, error_msg
+
+
+def _kill_validation_process(proc: asyncio.subprocess.Process) -> None:
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
 
 
 async def apply_patch_async(
@@ -103,7 +125,10 @@ async def apply_patch_async(
 
 
 async def validate_code_async(
-    code_path: str, language: str = "python", timeout: int = 30
+    code_path: str,
+    language: str = "python",
+    timeout: int = 30,
+    rust_edition: str = "2015",
 ) -> Tuple[bool, Optional[str]]:
     """Async code validation using subprocess.
 
@@ -111,11 +136,16 @@ async def validate_code_async(
         code_path: Path to code file to validate
         language: Programming language
         timeout: Timeout for validation in seconds
+        rust_edition: Rust edition used when validating Rust source
 
     Returns:
         Tuple of (is_valid, error_message)
     """
     try:
+        try:
+            language = normalize_language(language)
+        except ValueError:
+            language = language.strip().lower()
         if language == "python":
             # Use python -m py_compile for syntax checking
             return await _run_validation_subprocess(
@@ -127,14 +157,45 @@ async def validate_code_async(
             )
 
         elif language == "rust":
-            # Use rustc for Rust syntax checking
-            return await _run_validation_subprocess(
-                "rustc",
-                "--crate-type=lib",
-                "-Zparse-only",
-                code_path,
-                timeout=timeout,
-            )
+            # Use rustfmt for Rust syntax checking.
+            #
+            # `-Zparse-only` is gated to the nightly channel: on a stable
+            # toolchain rustc rejects the flag and exits non-zero before it
+            # parses anything, so every candidate would be reported invalid.
+            # Stable rustc has no parse-only equivalent. In particular,
+            # `--emit=dep-info` performs name resolution and expands built-in
+            # macros, which both rejects valid dependency-backed code and lets
+            # generated code read host files via `include_str!`. rustfmt parses
+            # the token stream without type checking or macro expansion.
+            # `skip_children` prevents `mod` declarations (including `#[path]`
+            # overrides) from making rustfmt read other host files. A clean
+            # config prevents a project rustfmt.toml from disabling parsing.
+            # Stdout mode also guarantees validation never rewrites the source.
+            if shutil.which("rustfmt") is None:
+                return (
+                    False,
+                    (
+                        "Rust validation requires rustfmt on PATH. Install it with "
+                        "`rustup component add rustfmt`."
+                    ),
+                )
+            with tempfile.TemporaryDirectory(prefix="shinka-rustfmt-") as config_dir:
+                config_path = Path(config_dir) / "rustfmt.toml"
+                config_path.touch()
+                return await _run_validation_subprocess(
+                    "rustfmt",
+                    "--config-path",
+                    str(config_path),
+                    "--emit",
+                    "stdout",
+                    "--edition",
+                    rust_edition,
+                    "--config",
+                    "skip_children=true",
+                    "--",
+                    code_path,
+                    timeout=timeout,
+                )
         elif language == "swift":
             # Use swiftc for Swift compilation check
             return await _run_validation_subprocess(
@@ -157,15 +218,49 @@ async def validate_code_async(
                 code_path,
                 timeout=timeout,
             )
+        elif language == "fortran":
+            # Use gfortran for Fortran syntax checking
+            return await _run_validation_subprocess(
+                "gfortran",
+                "-fsyntax-only",
+                code_path,
+                timeout=timeout,
+            )
+        elif language == "verilog":
+            return await _run_validation_subprocess(
+                "iverilog",
+                "-t",
+                "null",
+                "-g2012",
+                code_path,
+                timeout=timeout,
+            )
+        elif language == "wolfram":
+            # Parse-only via Hold prevents evaluation; non-Hold result indicates a parse error.
+            check_code = (
+                f'If[Head[ToExpression[Import["{escape_wolfram_string(code_path)}", '
+                '"Text"], InputForm, Hold]] === Hold, Print["OK"], Exit[1]]'
+            )
+            argv = build_wolframscript_argv(["-code", check_code])
+            return await _run_validation_subprocess(*argv, timeout=timeout)
         else:
             # For other languages, just check if file exists and is readable
             try:
-                async with aiofiles.open(code_path, "r") as f:
-                    content = await f.read()
-                    if len(content.strip()) > 0:
-                        return True, None
-                    else:
-                        return False, "Empty code file"
+                if aiofiles:
+                    async with aiofiles.open(
+                        code_path, "r", encoding=TEXT_ENCODING
+                    ) as f:
+                        content = await f.read()
+                else:
+                    loop = asyncio.get_event_loop()
+                    content = await loop.run_in_executor(
+                        None,
+                        lambda: Path(code_path).read_text(encoding=TEXT_ENCODING),
+                    )
+
+                if len(content.strip()) > 0:
+                    return True, None
+                return False, "Empty code file"
             except Exception as e:
                 return False, f"File read error: {str(e)}"
 
@@ -193,13 +288,16 @@ async def write_file_async(file_path: str, content: str) -> bool:
 
         if aiofiles:
             # Use aiofiles if available
-            async with aiofiles.open(file_path, "w") as f:
+            async with aiofiles.open(file_path, "w", encoding=TEXT_ENCODING) as f:
                 await f.write(content)
         else:
             # Fall back to sync I/O in thread pool
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
-                None, lambda: Path(file_path).write_text(content)
+                None,
+                lambda: Path(file_path).write_text(
+                    content, encoding=TEXT_ENCODING
+                ),
             )
 
         return True
@@ -221,13 +319,13 @@ async def read_file_async(file_path: str) -> Optional[str]:
     try:
         if aiofiles:
             # Use aiofiles if available
-            async with aiofiles.open(file_path, "r") as f:
+            async with aiofiles.open(file_path, "r", encoding=TEXT_ENCODING) as f:
                 content = await f.read()
         else:
             # Fall back to sync I/O in thread pool
             loop = asyncio.get_event_loop()
             content = await loop.run_in_executor(
-                None, lambda: Path(file_path).read_text()
+                None, lambda: Path(file_path).read_text(encoding=TEXT_ENCODING)
             )
         return content
 

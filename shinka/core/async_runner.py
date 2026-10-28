@@ -13,9 +13,11 @@ import os
 import math
 import psutil
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from functools import partial
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Set, Tuple, Union
+from typing import List, Optional, Dict, Any, Set, Tuple, Union, Iterable
 from dataclasses import dataclass, field
 from rich.console import Console
 from rich.table import Table
@@ -37,7 +39,7 @@ from shinka.llm import (
     ThompsonSampler,
 )
 from shinka.embed import AsyncEmbeddingClient
-from shinka.launch import JobScheduler, JobConfig
+from shinka.launch import JobScheduler, JobConfig, LocalJobConfig
 from shinka.edit.async_apply import (
     apply_patch_async,
     get_code_embedding_async,
@@ -50,30 +52,54 @@ from shinka.core.async_summarizer import AsyncMetaSummarizer
 from shinka.core.async_novelty_judge import AsyncNoveltyJudge
 from shinka.core.novelty_judge import NoveltyJudge
 from shinka.core.config import EvolutionConfig, FOLDER_PREFIX
-from shinka.core.pipeline_timing import with_pipeline_timing
+from shinka.core.pipeline_timing import (
+    summarize_timing_metadata,
+    with_pipeline_timing,
+    with_side_effect_timing,
+)
 from shinka.core.prompt_evolver import (
     SystemPromptSampler,
     AsyncSystemPromptEvolver,
 )
 from shinka.core.runtime_slots import LogicalSlotPool
-from shinka.logo import print_gradient_logo, shinka_ascii
-from shinka.utils import get_language_extension, parse_time_to_seconds
+from shinka.logo import BannerStyle, get_logo_ascii, print_gradient_logo
+from shinka.model_availability import validate_model_env_access
+from shinka.pricing.catalog import (
+    activate_model_catalog,
+    load_run_pricing_snapshot,
+    refresh_model_catalog,
+    write_run_pricing_snapshot,
+)
+from shinka.wandb_logging import ShinkaWandbLogger
+from shinka.wandb_metrics import build_program_log_payload, is_island_copy
+from shinka.utils import (
+    get_language_extension,
+    parse_time_to_seconds,
+    truncate_log_tail,
+)
 from shinka.utils.languages import get_evolve_comment_prefix
 
 logger = logging.getLogger(__name__)
 
+_WANDB_CANDIDATE_QUEUE_SIZE = 256
+_WANDB_DROP_WARNING_INTERVAL_SECONDS = 30.0
+_WANDB_POPULATION_INTERVAL_SECONDS = 5.0
+_WANDB_CANDIDATE_STOP = object()
 
-def _print_gradient_logo_and_mirror(log_path: Optional[Path] = None) -> None:
+
+def _print_gradient_logo_and_mirror(
+    log_path: Optional[Path] = None,
+    banner_style: BannerStyle = "full",
+) -> None:
     """Print gradient logo to terminal and mirror plain ASCII to log."""
-    print_gradient_logo((255, 0, 0), (255, 255, 255))
+    logo_ascii = get_logo_ascii(banner_style)
+    print_gradient_logo((255, 0, 0), (255, 255, 255), logo_ascii=logo_ascii)
     if log_path is None:
         return
 
     try:
         with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(
-                shinka_ascii if shinka_ascii.endswith("\n") else f"{shinka_ascii}\n"
-            )
+            handle.write(logo_ascii if logo_ascii.endswith("\n") else f"{logo_ascii}\n")
     except Exception:
         # Never break startup output if log write fails.
         pass
@@ -144,6 +170,7 @@ class AsyncRunningJob:
     proposal_task_id: Optional[str] = None  # Track which proposal task created this job
     db_retry_count: int = 0  # Track number of DB write retry attempts
     results_retrieved_at: Optional[float] = None
+    completion_detected_at: Optional[float] = None
     discard_if_completed: bool = False
     evaluation_slot_released: bool = False
 
@@ -168,6 +195,46 @@ class CompletedJobPersistResult:
     persisted_event: Optional[PersistedProgramEvent] = None
 
 
+def _dedupe_model_names(model_names: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for model_name in model_names:
+        if model_name in seen:
+            continue
+        seen.add(model_name)
+        deduped.append(model_name)
+    return deduped
+
+
+def _llm_kwargs_with_headless_work_dir(
+    llm_kwargs: Dict[str, Any],
+    results_dir: Path,
+) -> Dict[str, Any]:
+    return {"headless_work_dir": str(results_dir), **llm_kwargs}
+
+
+def _validate_evo_config_model_env_access(evo_config: EvolutionConfig) -> None:
+    llm_models = list(evo_config.llm_models)
+
+    if evo_config.meta_rec_interval and evo_config.meta_llm_models:
+        llm_models.extend(evo_config.meta_llm_models)
+
+    if evo_config.novelty_llm_models:
+        llm_models.extend(evo_config.novelty_llm_models)
+
+    if evo_config.evolve_prompts and evo_config.prompt_llm_models:
+        llm_models.extend(evo_config.prompt_llm_models)
+
+    embedding_models = (
+        [evo_config.embedding_model] if evo_config.embedding_model else []
+    )
+
+    validate_model_env_access(
+        llm_models=_dedupe_model_names(llm_models),
+        embedding_models=_dedupe_model_names(embedding_models),
+    )
+
+
 class ShinkaEvolveRunner:
     """Fully async evolution runner with concurrent proposal generation."""
 
@@ -176,10 +243,11 @@ class ShinkaEvolveRunner:
         evo_config: EvolutionConfig,
         job_config: JobConfig,
         db_config: DatabaseConfig,
+        banner_style: BannerStyle = "full",
         verbose: bool = True,
-        max_evaluation_jobs: int = 2,
-        max_proposal_jobs: int = 1,
-        max_db_workers: int = 4,
+        max_evaluation_jobs: int = 4,
+        max_proposal_jobs: int = 6,
+        max_db_workers: int = 2,
         debug: bool = False,
         init_program_str: Optional[str] = None,
         evaluate_str: Optional[str] = None,
@@ -192,16 +260,24 @@ class ShinkaEvolveRunner:
             db_config: Database configuration
             verbose: Enable verbose logging
             max_evaluation_jobs: Maximum concurrent evaluation jobs
-                (defaults to 2)
-            max_proposal_jobs: Maximum concurrent proposal generation tasks
-                (defaults to 1)
-            max_db_workers: Maximum concurrent async DB worker threads
                 (defaults to 4)
+            max_proposal_jobs: Maximum concurrent proposal generation tasks
+                (defaults to 6)
+            max_db_workers: Maximum concurrent async DB worker threads
+                (defaults to 2)
             init_program_str: Optional string content for initial program
                 (will be saved to results dir and path updated in evo_config)
             evaluate_str: Optional string content for evaluate script
                 (will be saved to results dir and path updated in job_config)
         """
+        pricing_snapshot = (
+            load_run_pricing_snapshot(Path(evo_config.results_dir))
+            if evo_config.results_dir is not None
+            else None
+        )
+        pricing_snapshot = pricing_snapshot or refresh_model_catalog()
+        _validate_evo_config_model_env_access(evo_config)
+
         self.verbose = verbose
         # Setup results directory first
         if evo_config.results_dir is None:
@@ -213,6 +289,8 @@ class ShinkaEvolveRunner:
         self.evo_config = evo_config
         self.job_config = job_config
         self.db_config = db_config
+        self.wandb_logger = ShinkaWandbLogger(enabled=evo_config.enable_wandb_logging)
+        self.banner_style = banner_style
         self.enable_deadlock_debugging = debug
         log_filename = f"{self.results_dir}/evolution_run.log"
 
@@ -241,7 +319,19 @@ class ShinkaEvolveRunner:
             # Ensure results directory exists even when not verbose
             Path(self.results_dir).mkdir(parents=True, exist_ok=True)
 
-        _print_gradient_logo_and_mirror(Path(log_filename))
+        self.pricing_snapshot = pricing_snapshot
+        write_run_pricing_snapshot(pricing_snapshot, Path(self.results_dir))
+        logger.info(
+            "Pricing catalog: source=%s fetched_at=%s stale=%s sha256=%s",
+            pricing_snapshot.source,
+            pricing_snapshot.fetched_at,
+            pricing_snapshot.stale,
+            pricing_snapshot.sha256,
+        )
+
+        _print_gradient_logo_and_mirror(
+            Path(log_filename), banner_style=self.banner_style
+        )
 
         # Handle init_program_str: write to file and update config path
         if init_program_str is not None:
@@ -276,6 +366,7 @@ class ShinkaEvolveRunner:
         self.max_evaluation_jobs = max_evaluation_jobs
         self.max_proposal_jobs = max_proposal_jobs
         self.max_db_workers = max_db_workers
+        self._configure_local_job_runtime(cpu_count)
 
         if self.evo_config.num_generations is None:
             assert self.evo_config.max_api_costs is not None, (
@@ -335,7 +426,10 @@ class ShinkaEvolveRunner:
         # LLM clients
         self.llm = AsyncLLMClient(
             model_names=evo_config.llm_models,
-            **evo_config.llm_kwargs,
+            **_llm_kwargs_with_headless_work_dir(
+                evo_config.llm_kwargs,
+                Path(self.results_dir),
+            ),
         )
 
         # Embedding client (use async version for async runner)
@@ -366,7 +460,10 @@ class ShinkaEvolveRunner:
             # Create async LLM client for meta analysis
             async_meta_llm = AsyncLLMClient(
                 model_names=evo_config.meta_llm_models or evo_config.llm_models,
-                **evo_config.meta_llm_kwargs,
+                **_llm_kwargs_with_headless_work_dir(
+                    evo_config.meta_llm_kwargs,
+                    Path(self.results_dir),
+                ),
             )
             # Create sync summarizer for state management
             sync_meta_summarizer = MetaSummarizer(
@@ -388,7 +485,10 @@ class ShinkaEvolveRunner:
         if evo_config.novelty_llm_models:
             novelty_llm = AsyncLLMClient(
                 model_names=evo_config.novelty_llm_models,
-                **evo_config.novelty_llm_kwargs,
+                **_llm_kwargs_with_headless_work_dir(
+                    evo_config.novelty_llm_kwargs,
+                    Path(self.results_dir),
+                ),
             )
             sync_novelty_judge = NoveltyJudge(
                 novelty_llm_client=None,  # We'll use async version
@@ -420,7 +520,10 @@ class ShinkaEvolveRunner:
             prompt_llm_models = evo_config.prompt_llm_models or evo_config.llm_models
             self.prompt_llm = AsyncLLMClient(
                 model_names=prompt_llm_models,
-                **evo_config.prompt_llm_kwargs,
+                **_llm_kwargs_with_headless_work_dir(
+                    evo_config.prompt_llm_kwargs,
+                    Path(self.results_dir),
+                ),
             )
             logger.info(f"Prompt evolution enabled with models: {prompt_llm_models}")
         else:
@@ -465,6 +568,30 @@ class ShinkaEvolveRunner:
             self.max_evaluation_jobs, "evaluation"
         )
         self.postprocess_slot_pool = LogicalSlotPool(self.max_db_workers, "postprocess")
+        self.side_effect_event_queue: asyncio.Queue = asyncio.Queue()
+        self._background_side_effect_task: Optional[asyncio.Task] = None
+        self._background_side_effect_tasks: Set[asyncio.Task] = set()
+        self._background_side_effects_pending = 0
+        self._background_side_effects_busy = False
+        self._background_side_effects_busy_count = 0
+        self._completed_job_batch_tasks: Set[asyncio.Task] = set()
+        self._completed_jobs_pending = 0
+        self._wandb_population_task: Optional[asyncio.Task] = None
+        self._wandb_population_delay_task: Optional[asyncio.Task] = None
+        self._wandb_population_pending = False
+        self._wandb_last_population_snapshot_at: Optional[float] = None
+        self._wandb_population_interval_seconds = _WANDB_POPULATION_INTERVAL_SECONDS
+        self._wandb_executor: Optional[ThreadPoolExecutor] = None
+        self._wandb_candidate_queue: Optional[asyncio.Queue] = None
+        self._wandb_candidate_worker_task: Optional[asyncio.Task] = None
+        self._wandb_candidate_queue_size = _WANDB_CANDIDATE_QUEUE_SIZE
+        self._wandb_dropped_candidate_events = 0
+        self._wandb_last_drop_warning_at: Optional[float] = None
+        self._meta_side_effect_lock = asyncio.Lock()
+        self._prompt_side_effect_lock = asyncio.Lock()
+        self._best_solution_lock = asyncio.Lock()
+        self._prompt_percentile_recompute_task: Optional[asyncio.Task] = None
+        self._prompt_percentile_recompute_pending = False
 
         # Database retry mechanism
         self.failed_jobs_for_retry: Dict[
@@ -514,6 +641,65 @@ class ShinkaEvolveRunner:
                 )
         except Exception as e:
             logger.warning(f"Failed to load bandit state: {e}")
+
+    async def _record_generation_event(
+        self,
+        generation: int,
+        status: str,
+        source_job_id: Optional[Union[str, Any]] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Best-effort durable generation event logging."""
+        if not getattr(self, "enable_deadlock_debugging", False):
+            return
+        if not hasattr(self.async_db, "record_generation_event_async"):
+            return
+
+        normalized_job_id = None
+        if source_job_id is not None:
+            normalized_job_id = str(source_job_id)
+
+        try:
+            await self.async_db.record_generation_event_async(
+                generation=generation,
+                status=status,
+                source_job_id=normalized_job_id,
+                details=details,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to record generation event %s for gen %s: %s",
+                status,
+                generation,
+                e,
+            )
+
+    async def _record_attempt_event(
+        self,
+        generation: int,
+        stage: str,
+        status: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Best-effort durable attempt logging outside the programs table."""
+        if not hasattr(self.async_db, "record_attempt_event_async"):
+            return
+
+        try:
+            await self.async_db.record_attempt_event_async(
+                generation=generation,
+                stage=stage,
+                status=status,
+                details=details,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to record attempt event %s/%s for gen %s: %s",
+                stage,
+                status,
+                generation,
+                e,
+            )
 
     def _validate_concurrency_settings(
         self,
@@ -588,6 +774,20 @@ class ShinkaEvolveRunner:
                 )
 
         return max_evaluation_jobs, max_proposal_jobs, max_db_workers
+
+    def _configure_local_job_runtime(self, cpu_count: int) -> None:
+        """Tune local evaluation subprocess runtime defaults for scaling."""
+        if not isinstance(self.job_config, LocalJobConfig):
+            return
+
+        if self.job_config.numeric_threads_per_job is None:
+            numeric_threads = max(1, cpu_count // max(1, self.max_evaluation_jobs))
+            self.job_config.numeric_threads_per_job = numeric_threads
+            if self.verbose:
+                logger.info(
+                    "Configured local numeric thread cap per eval process: %s",
+                    numeric_threads,
+                )
 
     async def _get_total_api_costs(self) -> float:
         """Calculate total API costs from all programs and prompt evolution."""
@@ -718,11 +918,23 @@ class ShinkaEvolveRunner:
     def _compute_proposal_pipeline_target(self) -> int:
         """Compute the bounded proposal target for controlled oversubscription."""
         base_target = self.max_evaluation_jobs
-        if not getattr(self.evo_config, "enable_controlled_oversubscription", True):
+        if not getattr(self.evo_config, "enable_controlled_oversubscription", False):
             return base_target
 
         buffer_max = max(0, getattr(self.evo_config, "proposal_buffer_max", 0))
         hard_cap = getattr(self.evo_config, "proposal_target_hard_cap", None)
+        if hard_cap is not None and hard_cap < base_target:
+            if not getattr(
+                self, "_warned_invalid_proposal_target_hard_cap", False
+            ):
+                logger.warning(
+                    "Ignoring proposal_target_hard_cap=%s because it is below "
+                    "max_evaluation_jobs=%s and would disable oversubscription.",
+                    hard_cap,
+                    base_target,
+                )
+                self._warned_invalid_proposal_target_hard_cap = True
+            hard_cap = None
         effective_hard_cap = (
             self.max_proposal_jobs
             if hard_cap is None
@@ -799,10 +1011,19 @@ class ShinkaEvolveRunner:
             # asyncio.get_running_loop raises RuntimeError when no loop exists.
             if "no running event loop" not in str(exc):
                 raise
+
         asyncio.run(self.run_async())
 
     async def run_async(self):
+        """Run evolution while retaining provider clients for this loop user."""
+        from shinka.llm.client import async_client_cache_scope
+
+        async with async_client_cache_scope():
+            await self._run_async()
+
+    async def _run_async(self):
         """Main async evolution loop."""
+        activate_model_catalog(self.pricing_snapshot)
         self.start_time = time.time()
         self.last_progress_time = self.start_time  # Initialize progress tracking
         tasks = []  # Initialize tasks list to avoid UnboundLocalError
@@ -832,6 +1053,22 @@ class ShinkaEvolveRunner:
 
             # Wait for the finalization signal instead of gathering all tasks
             await self.finalization_complete.wait()
+
+            await self._wait_for_completed_job_batches()
+
+            if self._has_background_side_effect_work():
+                if self.verbose:
+                    logger.info(
+                        "Draining %s queued background side effect(s) before finalization...",
+                        self._get_background_side_effect_work_count(),
+                    )
+                await self._wait_for_background_side_effects()
+            await self._shutdown_background_side_effect_worker()
+            if self._prompt_percentile_recompute_task is not None:
+                await asyncio.gather(
+                    self._prompt_percentile_recompute_task,
+                    return_exceptions=True,
+                )
 
             # Perform final operations before cleanup
             if self.verbose:
@@ -898,6 +1135,8 @@ class ShinkaEvolveRunner:
                                 ),
                                 timeout=600.0,  # 10 minute timeout for final meta summary
                             )
+                            if success and final_meta_cost > 0:
+                                self.total_api_cost += final_meta_cost
                             if self.verbose:
                                 if success and final_meta_cost > 0:
                                     logger.info(
@@ -935,6 +1174,8 @@ class ShinkaEvolveRunner:
             logger.error(f"Error in async evolution run: {e}")
             raise
         finally:
+            await self._cancel_completed_job_batches()
+            await self._cancel_background_side_effect_worker()
             # Ensure all tasks are cancelled on exit
             for task in tasks:
                 task.cancel()
@@ -968,6 +1209,15 @@ class ShinkaEvolveRunner:
         # Initialize prompt evolution database if enabled
         if self.evo_config.evolve_prompts:
             await self._setup_prompt_evolution()
+
+        if self.wandb_logger.enabled:
+            await self._run_wandb_operation(
+                self.wandb_logger.start,
+                evo_config=self.evo_config,
+                db_config=self.db_config,
+                job_config=self.job_config,
+                results_dir=Path(self.results_dir),
+            )
 
         # Check if we're resuming from an existing database
         resuming_run = db_path.exists() and self.db.last_iteration > 0
@@ -1015,6 +1265,8 @@ class ShinkaEvolveRunner:
                         "generating initial program with LLM..."
                     )
                 await self._generate_initial_program()
+
+        self._log_wandb_population_progress()
 
     async def _setup_prompt_evolution(self):
         """Setup prompt evolution database and components."""
@@ -1153,44 +1405,96 @@ class ShinkaEvolveRunner:
 
             # Periodically recompute all prompt percentiles to avoid stale fitness values
             # As population grows, old percentiles become outdated
-            self.prompt_percentile_recompute_counter += 1
+            if correct:
+                self.prompt_percentile_recompute_counter += 1
             recompute_interval = self.evo_config.prompt_percentile_recompute_interval
             if (
-                recompute_interval > 0
+                correct
+                and recompute_interval > 0
                 and self.prompt_percentile_recompute_counter >= recompute_interval
             ):
                 self.prompt_percentile_recompute_counter = 0
-                try:
-                    # Get all correct program scores from main database
-                    # This matches what the webUI uses for beat percentage calculation
-                    all_programs = self.db.get_all_programs()
-                    all_correct_scores = [
-                        p.combined_score
-                        for p in all_programs
-                        if p.correct and p.combined_score is not None
-                    ]
-                    # Build mapping from program_id to current score
-                    # This ensures we use actual current scores, not stale stored ones
-                    program_id_to_score = {
-                        p.id: p.combined_score
-                        for p in all_programs
-                        if p.correct and p.combined_score is not None
-                    }
-                    self.prompt_db.recompute_all_percentiles(
-                        all_correct_scores, program_id_to_score
-                    )
-                    logger.info(
-                        f"Recomputed prompt fitness percentiles "
-                        f"(every {recompute_interval} programs, "
-                        f"using {len(all_correct_scores)} correct program scores)"
-                    )
-                except Exception as recompute_err:
-                    logger.warning(
-                        f"Failed to recompute prompt percentiles: {recompute_err}"
-                    )
+                self._schedule_prompt_percentile_recompute(recompute_interval)
 
         except Exception as e:
             logger.error(f"Failed to update prompt fitness: {e}")
+
+    def _schedule_prompt_percentile_recompute(self, recompute_interval: int) -> None:
+        """Debounce global prompt percentile recomputation onto a background task."""
+        if not self.prompt_db:
+            return
+
+        task = self._prompt_percentile_recompute_task
+        if task is not None and not task.done():
+            self._prompt_percentile_recompute_pending = True
+            return
+
+        self._prompt_percentile_recompute_pending = False
+        self._prompt_percentile_recompute_task = asyncio.create_task(
+            self._recompute_prompt_percentiles_async(recompute_interval),
+            name="prompt_percentile_recompute",
+        )
+
+    async def _recompute_prompt_percentiles_async(self, recompute_interval: int) -> None:
+        """Refresh prompt fitness percentiles without blocking side-effect workers."""
+        try:
+            loop = asyncio.get_event_loop()
+            if hasattr(self.db, "config"):
+
+                def load_program_scores_thread_safe() -> Tuple[List[float], Dict[str, float]]:
+                    thread_db = None
+                    try:
+                        thread_db = ProgramDatabase(self.db.config, read_only=True)
+                        all_programs = thread_db.get_all_programs()
+                        all_correct_scores = [
+                            p.combined_score
+                            for p in all_programs
+                            if p.correct and p.combined_score is not None
+                        ]
+                        program_id_to_score = {
+                            p.id: p.combined_score
+                            for p in all_programs
+                            if p.correct and p.combined_score is not None
+                        }
+                        return all_correct_scores, program_id_to_score
+                    finally:
+                        if thread_db is not None:
+                            thread_db.close()
+
+                all_correct_scores, program_id_to_score = await loop.run_in_executor(
+                    None, load_program_scores_thread_safe
+                )
+            else:
+                all_programs = self.db.get_all_programs()
+                all_correct_scores = [
+                    p.combined_score
+                    for p in all_programs
+                    if p.correct and p.combined_score is not None
+                ]
+                program_id_to_score = {
+                    p.id: p.combined_score
+                    for p in all_programs
+                    if p.correct and p.combined_score is not None
+                }
+            self.prompt_db.recompute_all_percentiles(
+                all_correct_scores, program_id_to_score
+            )
+            logger.info(
+                "Recomputed prompt fitness percentiles "
+                "(every %s programs, using %s correct program scores)",
+                recompute_interval,
+                len(all_correct_scores),
+            )
+        except Exception as recompute_err:
+            logger.warning(
+                "Failed to recompute prompt percentiles: %s", recompute_err
+            )
+        finally:
+            rerun_requested = self._prompt_percentile_recompute_pending
+            self._prompt_percentile_recompute_pending = False
+            self._prompt_percentile_recompute_task = None
+            if rerun_requested:
+                self._schedule_prompt_percentile_recompute(recompute_interval)
 
     async def _maybe_evolve_prompt(self):
         """
@@ -1255,6 +1559,7 @@ class ShinkaEvolveRunner:
             )
 
             self.prompt_api_cost += cost
+            self.total_api_cost += cost
 
             if new_prompt:
                 self.prompt_db.add(new_prompt, verbose=self.verbose)
@@ -1326,7 +1631,10 @@ class ShinkaEvolveRunner:
             public_metrics = metrics_val.get("public", {})
             private_metrics = metrics_val.get("private", {})
             text_feedback = metrics_val.get("text_feedback", "")
-            stdout_log = results.get("stdout_log", "")
+            stdout_log = truncate_log_tail(
+                results.get("stdout_log", ""),
+                self.db_config.max_stdout_log_chars,
+            )
             stderr_log = results.get("stderr_log", "")
 
             # Build base metadata
@@ -1458,7 +1766,7 @@ class ShinkaEvolveRunner:
             )
 
         # Add to database
-        await self.async_db.add_program_async(initial_program)
+        await self.async_db.add_program_async(initial_program, verbose=self.verbose)
 
         # Add initial program costs to in-memory total for accurate budget tracking
         initial_api_cost = (initial_program.metadata or {}).get("api_costs", 0.0)
@@ -1528,6 +1836,7 @@ class ShinkaEvolveRunner:
             postprocess_finished_at=postprocess_finished_at,
         )
         await self._persist_program_metadata_async(initial_program)
+        self._log_program_to_wandb(initial_program)
 
         if self.verbose:
             logger.info(f"Setup initial program: {initial_program.id}")
@@ -1730,81 +2039,98 @@ class ShinkaEvolveRunner:
         logger.info("🔄 Job monitor task started")
 
         while not self.should_stop.is_set():
-            if not self.running_jobs:
-                # Debug: Log when waiting with no jobs
-                logger.debug(
-                    f"🔍 Job monitor waiting: completed_gens={self.completed_generations}, target={self.evo_config.num_generations}, no running jobs"
-                )
-                await asyncio.sleep(1)
-                continue
-
             try:
-                # Check job statuses concurrently
-                status_results = await self.scheduler.batch_check_status_async(
-                    self.running_jobs
-                )
-                if self.verbose:
-                    # Create safe status display to avoid race conditions
-                    try:
-                        status_display = []
-                        for i, job in enumerate(self.running_jobs):
-                            if i < len(status_results):
-                                status_display.append(
-                                    f"{job.generation} - {status_results[i]}"
-                                )
-                            else:
-                                status_display.append(f"{job.generation} - unknown")
-
-                        logger.debug(
-                            f"Job statuses ({len(self.running_jobs)}): gen [{', '.join(status_display)}]"
-                        )
-                        logger.debug(
-                            f"Active proposal jobs ({len(self.active_proposal_tasks)}): gen [{', '.join([task.get_name().split('_')[1] if task.get_name().startswith('proposal_') else 'unknown' for task in self.active_proposal_tasks.values()])}]"
-                        )
-                    except Exception as e:
-                        logger.warning(f"Error in status logging: {e}")
-                        logger.debug(
-                            f"Running jobs: {len(self.running_jobs)}, Active proposals: {len(self.active_proposal_tasks)}"
-                        )
                 completed_jobs = []
-                still_running = []
+                if not self.running_jobs:
+                    logger.debug(
+                        "🔍 Job monitor idle: completed_gens=%s, target=%s, "
+                        "running_jobs=0, active_proposals=%s",
+                        self.completed_generations,
+                        self.evo_config.num_generations,
+                        len(self.active_proposal_tasks),
+                    )
+                else:
+                    monitored_jobs = list(self.running_jobs)
+                    # Check job statuses concurrently
+                    status_results = await self.scheduler.batch_check_status_async(
+                        monitored_jobs
+                    )
+                    if self.verbose:
+                        # Create safe status display to avoid race conditions
+                        try:
+                            status_display = []
+                            for i, job in enumerate(monitored_jobs):
+                                if i < len(status_results):
+                                    status_display.append(
+                                        f"{job.generation} - {status_results[i]}"
+                                    )
+                                else:
+                                    status_display.append(
+                                        f"{job.generation} - unknown"
+                                    )
 
-                for job, is_running in zip(self.running_jobs, status_results):
-                    if isinstance(is_running, Exception):
-                        logger.warning(f"Error checking job {job.job_id}: {is_running}")
-                        still_running.append(job)
-                    elif not is_running:
-                        completed_jobs.append(job)
-                        runtime = time.time() - job.start_time
-                        if self.verbose:
-                            logger.info(
-                                f"✅ Job {job.job_id} completed (gen {job.generation}) after {runtime:.1f}s"
+                            logger.debug(
+                                f"Job statuses ({len(monitored_jobs)}): gen [{', '.join(status_display)}]"
                             )
-                    elif self._is_job_hung(job):
-                        runtime = time.time() - (
-                            job.evaluation_started_at
-                            or job.evaluation_submitted_at
-                            or job.start_time
-                        )
-                        logger.warning(
-                            f"⏱️  Hung job detected for gen {job.generation}: "
-                            f"runtime={runtime:.1f}s. Cancelling for recovery."
-                        )
-                        cancelled = await self.scheduler.cancel_job_async(job.job_id)
-                        if not cancelled:
+                            logger.debug(
+                                f"Active proposal jobs ({len(self.active_proposal_tasks)}): gen [{', '.join([task.get_name().split('_')[1] if task.get_name().startswith('proposal_') else 'unknown' for task in self.active_proposal_tasks.values()])}]"
+                            )
+                        except Exception as e:
+                            logger.warning(f"Error in status logging: {e}")
+                            logger.debug(
+                                f"Running jobs: {len(self.running_jobs)}, Active proposals: {len(self.active_proposal_tasks)}"
+                            )
+                    still_running = []
+                    current_running_jobs = list(self.running_jobs)
+                    current_job_ids = {id(job) for job in current_running_jobs}
+                    monitored_job_ids = {id(job) for job in monitored_jobs}
+                    concurrently_added_jobs = [
+                        job
+                        for job in current_running_jobs
+                        if id(job) not in monitored_job_ids
+                    ]
+
+                    for job, is_running in zip(monitored_jobs, status_results):
+                        if id(job) not in current_job_ids:
+                            continue
+                        if isinstance(is_running, Exception):
                             logger.warning(
-                                f"Failed to cancel hung job {job.job_id} "
-                                f"(gen {job.generation}); keeping it running"
+                                f"Error checking job {job.job_id}: {is_running}"
                             )
                             still_running.append(job)
-                            continue
-                        completed_jobs.append(job)
-                    else:
-                        still_running.append(job)
+                        elif not is_running:
+                            completed_jobs.append(job)
+                            runtime = time.time() - job.start_time
+                            if self.verbose:
+                                logger.info(
+                                    f"✅ Job {job.job_id} completed (gen {job.generation}) after {runtime:.1f}s"
+                                )
+                        elif self._is_job_hung(job):
+                            runtime = time.time() - (
+                                job.evaluation_started_at
+                                or job.evaluation_submitted_at
+                                or job.start_time
+                            )
+                            logger.warning(
+                                f"⏱️  Hung job detected for gen {job.generation}: "
+                                f"runtime={runtime:.1f}s. Cancelling for recovery."
+                            )
+                            cancelled = await self.scheduler.cancel_job_async(
+                                job.job_id
+                            )
+                            if not cancelled:
+                                logger.warning(
+                                    f"Failed to cancel hung job {job.job_id} "
+                                    f"(gen {job.generation}); keeping it running"
+                                )
+                                still_running.append(job)
+                                continue
+                            completed_jobs.append(job)
+                        else:
+                            still_running.append(job)
 
-                self.running_jobs = still_running
+                    self.running_jobs = still_running + concurrently_added_jobs
 
-                # Process completed jobs atomically with lock to prevent race conditions
                 if completed_jobs:
                     if self.verbose:
                         job_gens = [job.generation for job in completed_jobs]
@@ -1825,14 +2151,15 @@ class ShinkaEvolveRunner:
                         )
 
                     async with self.processing_lock:
-                        self._mark_surplus_completed_jobs_for_discard(completed_jobs)
                         old_retry_count = len(self.failed_jobs_for_retry)
-                        old_completed = self.completed_generations
+                        self._mark_surplus_completed_jobs_for_discard(completed_jobs)
                         await self._process_completed_jobs_safely(completed_jobs)
+                        old_completed = self.completed_generations
+                        await self._update_completed_generations()
+                        self._log_wandb_population_progress()
 
                         if self.verbose:
                             if self.completed_generations != old_completed:
-                                # Format API cost info
                                 if self.evo_config.max_api_costs is not None:
                                     cost_str = (
                                         f"${self.total_api_cost:.4f}/"
@@ -1852,12 +2179,9 @@ class ShinkaEvolveRunner:
                                     f"{cost_info}"
                                 )
                             else:
-                                # Log why count didn't change
                                 retry_count = len(self.failed_jobs_for_retry)
                                 new_retries = retry_count - old_retry_count
                                 running_count = len(self.running_jobs)
-
-                                # Check if we're at target (capped)
                                 at_target = (
                                     self.completed_generations
                                     >= self.evo_config.num_generations
@@ -1869,7 +2193,6 @@ class ShinkaEvolveRunner:
                                         f"{self.completed_generations}"
                                     )
                                 elif new_retries > 0:
-                                    # Format API cost info
                                     if self.evo_config.max_api_costs is not None:
                                         cost_str = (
                                             f"${self.total_api_cost:.4f}/"
@@ -1902,17 +2225,13 @@ class ShinkaEvolveRunner:
                                         f"retry={retry_count})"
                                     )
                                 else:
-                                    # Only warn if truly unexpected
                                     logger.warning(
                                         f"⚠️  Completed generations unchanged "
                                         f"after processing jobs: "
                                         f"{self.completed_generations}"
                                     )
 
-                    # Record progress when jobs complete
                     self._record_progress()
-
-                    # Signal that slots are available
                     self.slot_available.set()
 
                 # Retry any failed DB jobs
@@ -2114,11 +2433,23 @@ class ShinkaEvolveRunner:
                     and self._get_in_flight_work_count() == 0
                     and self.completed_generations < self.evo_config.num_generations
                 ):
+                    missing_generations = await self._get_missing_persisted_generations()
+                    await self._record_generation_event(
+                        generation=self.next_generation_to_submit,
+                        status="stopped_generation_budget_exhausted",
+                        details={
+                            "completed_generations": self.completed_generations,
+                            "target_generations": self.evo_config.num_generations,
+                            "next_generation_to_submit": self.next_generation_to_submit,
+                            "missing_generations": missing_generations,
+                        },
+                    )
                     logger.warning(
                         "Generation budget exhausted before reaching target "
                         f"completed generations: completed={self.completed_generations}, "
                         f"target={self.evo_config.num_generations}, "
-                        f"next_generation={self.next_generation_to_submit}. "
+                        f"next_generation={self.next_generation_to_submit}, "
+                        f"missing_generations={missing_generations}. "
                         "Stopping without oversampling additional generations."
                     )
                     self.should_stop.set()
@@ -2264,8 +2595,8 @@ class ShinkaEvolveRunner:
         # Count all proposal attempts (including failures)
         self.total_proposals_generated += 1
         proposal_started_at = time.time()
-        sampling_worker_id = await self.sampling_slot_pool.acquire()
-        active_proposals_at_start = self.sampling_slot_pool.in_use
+        sampling_worker_id = None
+        active_proposals_at_start = len(self.active_proposal_tasks)
         try:
             if self.verbose:
                 logger.info(f"Generating proposal for generation {generation}")
@@ -2378,7 +2709,7 @@ class ShinkaEvolveRunner:
         meta_summary: Optional[str],
         meta_scratch: Optional[str],
         proposal_started_at: float,
-        sampling_worker_id: int,
+        sampling_worker_id: Optional[int],
         active_proposals_at_start: int,
     ) -> Optional[AsyncRunningJob]:
         """Generate an evolved proposal through the full pipeline."""
@@ -2389,12 +2720,20 @@ class ShinkaEvolveRunner:
         novelty_checks_performed = 0
         novelty_total_cost = 0.0
         novelty_explanation = ""
+        last_failure_stage = "proposal"
+        last_failure_reason = "LLM failed to generate a valid proposal after all attempts"
         proposal_accepted = False
+        parent_program: Optional[Program] = None
+        archive_programs: List[Program] = []
+        top_k_programs: List[Program] = []
+        code_diff: Optional[str] = None
+        meta_patch_data: Dict[str, Any] = {}
+        code_embedding: Optional[List[float]] = None
 
         # Select LLM once per program generation (before all loops)
         model_sample_probs = None
         model_posterior = None
-        if self.llm_selection is not None:
+        if getattr(self, "llm_selection", None) is not None:
             model_sample_probs, model_posterior = self.llm_selection.select_llm()
 
         for attempt in range(self.evo_config.max_novelty_attempts):
@@ -2458,12 +2797,20 @@ class ShinkaEvolveRunner:
                         )
 
                     if not patch_result:
+                        last_failure_stage = "proposal"
+                        last_failure_reason = "Patch generation returned no result"
                         continue
 
                     code_diff, meta_patch_data, success = patch_result
                     api_costs += meta_patch_data.get("api_costs", 0.0)
 
                     if not success:
+                        last_failure_stage = "proposal"
+                        last_failure_reason = (
+                            meta_patch_data.get("last_error_msg")
+                            or meta_patch_data.get("error_attempt")
+                            or "Patch generation failed before evaluation"
+                        )
                         continue
 
                     # We have a successful patch, break from resample loop
@@ -2473,6 +2820,8 @@ class ShinkaEvolveRunner:
                     logger.warning(
                         f"Error in patch generation attempt {resample + 1}: {e}"
                     )
+                    last_failure_stage = "proposal"
+                    last_failure_reason = str(e)
                     continue
             else:
                 # No successful patch in all resamples, continue to next novelty attempt
@@ -2521,11 +2870,27 @@ class ShinkaEvolveRunner:
                     novelty_explanation = novelty_metadata.get(
                         "novelty_explanation", ""
                     )
+                    meta_patch_data["novelty_checks_performed"] = (
+                        novelty_checks_performed
+                    )
+                    meta_patch_data["novelty_cost"] = novelty_total_cost
+                    meta_patch_data["novelty_explanation"] = novelty_explanation
+                    meta_patch_data["max_similarity"] = novelty_metadata.get(
+                        "max_similarity"
+                    )
+                    meta_patch_data["similarity_scores"] = novelty_metadata.get(
+                        "similarity_scores", []
+                    )
 
                     if should_accept:
                         proposal_accepted = True
                         break
                     # If not accepted, continue to next attempt (rejection sampling)
+                    last_failure_stage = "novelty"
+                    last_failure_reason = (
+                        novelty_explanation
+                        or "Proposal rejected by novelty check before downstream evaluation"
+                    )
                 else:
                     proposal_accepted = True
                     if not self.db.island_manager or not hasattr(
@@ -2562,7 +2927,6 @@ class ShinkaEvolveRunner:
                 )
                 meta_patch_data["novelty_explanation"] = novelty_explanation
 
-            evaluation_worker_id = None
             try:
                 (
                     job_id,
@@ -2639,12 +3003,47 @@ class ShinkaEvolveRunner:
                 return running_job
 
             except Exception as e:
-                await self.evaluation_slot_pool.release(evaluation_worker_id)
                 logger.error(f"Error submitting job: {e}")
+                await self._record_terminal_failed_proposal(
+                    generation=generation,
+                    exec_fname=exec_fname,
+                    proposal_started_at=proposal_started_at,
+                    sampling_worker_id=sampling_worker_id,
+                    active_proposals_at_start=active_proposals_at_start,
+                    parent_program=parent_program,
+                    archive_programs=archive_programs,
+                    top_k_programs=top_k_programs,
+                    code_diff=code_diff,
+                    meta_patch_data=meta_patch_data,
+                    code_embedding=code_embedding,
+                    embed_cost=embed_cost,
+                    novelty_cost=novelty_total_cost,
+                    api_costs=api_costs,
+                    failure_stage="evaluation_submit",
+                    failure_reason=str(e),
+                )
                 return None
 
         logger.warning(
             f"Failed to generate proposal for generation {generation} after all attempts"
+        )
+        await self._record_terminal_failed_proposal(
+            generation=generation,
+            exec_fname=exec_fname,
+            proposal_started_at=proposal_started_at,
+            sampling_worker_id=sampling_worker_id,
+            active_proposals_at_start=active_proposals_at_start,
+            parent_program=parent_program,
+            archive_programs=archive_programs,
+            top_k_programs=top_k_programs,
+            code_diff=code_diff,
+            meta_patch_data=meta_patch_data,
+            code_embedding=code_embedding,
+            embed_cost=embed_cost,
+            novelty_cost=novelty_total_cost,
+            api_costs=api_costs,
+            failure_stage=last_failure_stage,
+            failure_reason=last_failure_reason,
         )
         return None
 
@@ -2684,6 +3083,17 @@ class ShinkaEvolveRunner:
             response_file = attempt_dir / "llm_response.txt"
             await write_file_async(str(response_file), response.content)
 
+        response_kwargs = getattr(response, "kwargs", {}) if response else {}
+        headless_prompt_path = response_kwargs.get("headless_prompt_path")
+        if headless_prompt_path:
+            prompt_source = Path(headless_prompt_path)
+            if prompt_source.exists():
+                prompt_file = attempt_dir / "headless_prompt.md"
+                await write_file_async(
+                    str(prompt_file),
+                    prompt_source.read_text(encoding="utf-8"),
+                )
+
         # Save patch text if available
         if patch_text:
             patch_file = attempt_dir / "patch.txt"
@@ -2705,10 +3115,295 @@ class ShinkaEvolveRunner:
 
         if response:
             metadata["llm_cost"] = response.cost
-            metadata["llm_model"] = getattr(response, "model", None)
+            metadata["llm_model"] = getattr(response, "model_name", None)
+            if headless_prompt_path:
+                metadata["headless_prompt_path"] = str(
+                    attempt_dir / "headless_prompt.md"
+                )
 
         metadata_file = attempt_dir / "metadata.json"
         await write_file_async(str(metadata_file), json.dumps(metadata, indent=2))
+
+    def _classify_failed_proposal(
+        self,
+        *,
+        failure_stage: str,
+        failure_reason: str,
+        meta_patch_data: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Normalize pre-evaluation failures into stable classes for UI/analytics."""
+        if failure_stage == "novelty":
+            return "novelty_rejected"
+        if failure_stage == "evaluation_submit":
+            return "evaluation_submit_failed"
+
+        reason = (failure_reason or "").lower()
+        error_attempt = str((meta_patch_data or {}).get("error_attempt") or "").lower()
+        last_error_msg = str((meta_patch_data or {}).get("last_error_msg") or "").lower()
+        combined = " ".join(
+            part for part in [reason, error_attempt, last_error_msg] if part
+        )
+
+        if (
+            "could not extract code" in combined
+            or "llm response content was none" in combined
+            or "no evolve-block regions found" in combined
+        ):
+            return "llm_output_invalid"
+        if (
+            "search text not found" in combined
+            or "no changes applied" in combined
+            or "editable regions" in combined
+        ):
+            return "patch_apply_failed"
+
+        return "proposal_generation_failed"
+
+    def _collect_failure_artifacts(
+        self,
+        *,
+        exec_fname: str,
+        meta_patch_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Collect the well-known artifact paths for a failed generation."""
+        exec_path = Path(exec_fname)
+        gen_dir = exec_path.parent
+        artifacts: Dict[str, Any] = {
+            "generation_dir": str(gen_dir),
+            "generated_code_path": str(exec_path),
+            "results_dir": str(gen_dir / "results"),
+        }
+
+        def add_if_exists(key: str, path: Path) -> None:
+            if path.exists():
+                artifacts[key] = str(path)
+
+        add_if_exists("generation_diff_path", gen_dir / "edit.diff")
+        add_if_exists("generation_search_replace_path", gen_dir / "search_replace.txt")
+        add_if_exists("generation_rewrite_path", gen_dir / "rewrite.txt")
+        add_if_exists("generation_original_path", gen_dir / f"original.{self.lang_ext}")
+
+        if meta_patch_data:
+            novelty_attempt = meta_patch_data.get("novelty_attempt")
+            resample_attempt = meta_patch_data.get("resample_attempt")
+            patch_attempt = meta_patch_data.get("patch_attempt")
+            if all(
+                value is not None
+                for value in [novelty_attempt, resample_attempt, patch_attempt]
+            ):
+                attempt_dir = (
+                    gen_dir
+                    / "attempts"
+                    / f"novelty_{novelty_attempt}"
+                    / f"resample_{resample_attempt}"
+                    / f"patch_{patch_attempt}"
+                )
+                artifacts["attempt_dir"] = str(attempt_dir)
+                add_if_exists("attempt_metadata_path", attempt_dir / "metadata.json")
+                add_if_exists("llm_response_path", attempt_dir / "llm_response.txt")
+                add_if_exists("attempt_patch_path", attempt_dir / "patch.txt")
+
+        return artifacts
+
+    def _get_failure_language(self, exec_path: Path) -> str:
+        """Infer the failed proposal language from config or the generated filename."""
+        configured_language = getattr(self.evo_config, "language", None)
+        if configured_language:
+            return configured_language
+
+        ext = exec_path.suffix.lstrip(".").lower()
+        return {
+            "py": "python",
+            "js": "javascript",
+            "ts": "typescript",
+            "cpp": "cpp",
+            "cc": "cpp",
+            "cxx": "cpp",
+            "cu": "cuda",
+            "go": "go",
+            "sv": "verilog",
+            "f90": "fortran",
+            "f95": "fortran",
+            "f03": "fortran",
+            "f08": "fortran",
+        }.get(ext, ext or "python")
+
+    async def _write_failure_artifact_async(
+        self,
+        *,
+        generation: int,
+        exec_fname: str,
+        parent_program: Optional[Program],
+        archive_programs: List[Program],
+        top_k_programs: List[Program],
+        meta_patch_data: Optional[Dict[str, Any]],
+        embed_cost: float,
+        novelty_cost: float,
+        api_costs: float,
+        failure_stage: str,
+        failure_class: str,
+        failure_reason: str,
+        code_embedding: Optional[List[float]],
+        proposal_started_at: float,
+        sampling_worker_id: Optional[int],
+        active_proposals_at_start: int,
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Write the durable `failure.json` payload for a failed generation."""
+        exec_path = Path(exec_fname)
+        failure_path = exec_path.parent / "failure.json"
+        artifacts = self._collect_failure_artifacts(
+            exec_fname=exec_fname,
+            meta_patch_data=meta_patch_data,
+        )
+
+        payload = {
+            "generation": generation,
+            "node_kind": "failed_proposal",
+            "language": self._get_failure_language(exec_path),
+            "failure_stage": failure_stage,
+            "failure_class": failure_class,
+            "failure_reason": failure_reason,
+            "timestamp": datetime.now().isoformat(),
+            "proposal_started_at": proposal_started_at,
+            "sampling_worker_id": sampling_worker_id,
+            "active_proposals_at_start": active_proposals_at_start,
+            "downstream_eval_submitted": False,
+            "generated_code_available": exec_path.exists(),
+            "code_embedding_available": bool(code_embedding),
+            "parent_id": parent_program.id if parent_program else None,
+            "archive_inspiration_ids": [p.id for p in archive_programs],
+            "top_k_inspiration_ids": [p.id for p in top_k_programs],
+            "patch_type": (meta_patch_data or {}).get("patch_type"),
+            "patch_name": (meta_patch_data or {}).get("patch_name"),
+            "patch_description": (meta_patch_data or {}).get("patch_description"),
+            "system_prompt_id": (meta_patch_data or {}).get("system_prompt_id"),
+            "api_costs": api_costs,
+            "embed_cost": embed_cost,
+            "novelty_cost": novelty_cost,
+            "novelty_checks_performed": (meta_patch_data or {}).get(
+                "novelty_checks_performed", 0
+            ),
+            "novelty_explanation": (meta_patch_data or {}).get(
+                "novelty_explanation", ""
+            ),
+            "max_similarity": (meta_patch_data or {}).get("max_similarity"),
+            "attempts": {
+                "novelty_attempt": (meta_patch_data or {}).get("novelty_attempt"),
+                "resample_attempt": (meta_patch_data or {}).get("resample_attempt"),
+                "patch_attempt": (meta_patch_data or {}).get("patch_attempt"),
+            },
+            "error_attempt": (meta_patch_data or {}).get("error_attempt"),
+            "last_error_msg": (meta_patch_data or {}).get("last_error_msg"),
+            "artifacts": artifacts,
+            "failure_json_path": str(failure_path),
+        }
+
+        await write_file_async(
+            str(failure_path),
+            json.dumps(payload, indent=2, sort_keys=True),
+        )
+        return str(failure_path), payload
+
+    async def _record_terminal_failed_proposal(
+        self,
+        *,
+        generation: int,
+        exec_fname: str,
+        proposal_started_at: float,
+        sampling_worker_id: Optional[int],
+        active_proposals_at_start: int,
+        parent_program: Optional[Program],
+        archive_programs: List[Program],
+        top_k_programs: List[Program],
+        code_diff: Optional[str],
+        meta_patch_data: Optional[Dict[str, Any]],
+        code_embedding: Optional[List[float]],
+        embed_cost: float,
+        novelty_cost: float,
+        api_costs: float,
+        failure_stage: str,
+        failure_reason: str,
+    ) -> None:
+        """Record one terminal pre-eval failure via attempt_log plus failure.json."""
+        terminal_failure_cost = float(api_costs) + float(embed_cost) + float(
+            novelty_cost
+        )
+        self.total_api_cost += terminal_failure_cost
+        if terminal_failure_cost > 0.0:
+            self._update_avg_proposal_cost(terminal_failure_cost)
+        failure_class = self._classify_failed_proposal(
+            failure_stage=failure_stage,
+            failure_reason=failure_reason,
+            meta_patch_data=meta_patch_data,
+        )
+        failure_json_path, failure_payload = await self._write_failure_artifact_async(
+            generation=generation,
+            exec_fname=exec_fname,
+            parent_program=parent_program,
+            archive_programs=archive_programs,
+            top_k_programs=top_k_programs,
+            meta_patch_data=meta_patch_data,
+            embed_cost=embed_cost,
+            novelty_cost=novelty_cost,
+            api_costs=api_costs,
+            failure_stage=failure_stage,
+            failure_class=failure_class,
+            failure_reason=failure_reason,
+            code_embedding=code_embedding,
+            proposal_started_at=proposal_started_at,
+            sampling_worker_id=sampling_worker_id,
+            active_proposals_at_start=active_proposals_at_start,
+        )
+        terminal_failure_at = time.time()
+        await self._record_attempt_event(
+            generation=generation,
+            stage=failure_stage,
+            status="failed",
+            details={
+                "node_kind": "failed_proposal",
+                "language": failure_payload.get("language"),
+                "failure_stage": failure_stage,
+                "failure_class": failure_class,
+                "failure_reason": failure_reason,
+                "parent_id": parent_program.id if parent_program else None,
+                "archive_inspiration_ids": [p.id for p in archive_programs],
+                "top_k_inspiration_ids": [p.id for p in top_k_programs],
+                "code_diff_available": bool(code_diff),
+                "patch_type": (meta_patch_data or {}).get("patch_type"),
+                "patch_name": (meta_patch_data or {}).get("patch_name"),
+                "patch_description": (meta_patch_data or {}).get(
+                    "patch_description"
+                ),
+                "system_prompt_id": (meta_patch_data or {}).get("system_prompt_id"),
+                "model_name": (meta_patch_data or {}).get("model_name"),
+                "api_costs": api_costs,
+                "embed_cost": embed_cost,
+                "novelty_cost": novelty_cost,
+                "novelty_attempt": (meta_patch_data or {}).get("novelty_attempt"),
+                "resample_attempt": (meta_patch_data or {}).get("resample_attempt"),
+                "patch_attempt": (meta_patch_data or {}).get("patch_attempt"),
+                "max_similarity": (meta_patch_data or {}).get("max_similarity"),
+                "failure_json_path": failure_json_path,
+                "pipeline_started_at": proposal_started_at,
+                "sampling_started_at": proposal_started_at,
+                "sampling_finished_at": terminal_failure_at,
+                "evaluation_started_at": terminal_failure_at,
+                "evaluation_finished_at": terminal_failure_at,
+                "postprocess_started_at": terminal_failure_at,
+                "postprocess_finished_at": terminal_failure_at,
+                "timeline_lane_mode": "pool_slots",
+                "sampling_worker_id": sampling_worker_id,
+                "evaluation_worker_id": None,
+                "postprocess_worker_id": None,
+                "sampling_worker_capacity": self.max_proposal_jobs,
+                "evaluation_worker_capacity": self.max_evaluation_jobs,
+                "postprocess_worker_capacity": self.max_db_workers,
+                "generated_code_available": failure_payload.get(
+                    "generated_code_available", False
+                ),
+                "downstream_eval_submitted": False,
+            },
+        )
 
     async def _run_fix_patch_async(
         self,
@@ -2910,6 +3605,7 @@ class ShinkaEvolveRunner:
                 "patch_description": patch_description,
                 "num_applied": 0,
                 "error_attempt": "Max fix attempts reached without success.",
+                "last_error_msg": error_str if "error_str" in locals() else None,
                 "novelty_attempt": novelty_attempt,
                 "resample_attempt": resample_attempt,
                 "patch_attempt": self.evo_config.max_patch_attempts,
@@ -3140,10 +3836,13 @@ class ShinkaEvolveRunner:
                 if "patch_description" in locals()
                 else None,
                 "error_attempt": "Max attempts reached without successful patch",
+                "last_error_msg": error_str if "error_str" in locals() else None,
                 "novelty_attempt": novelty_attempt,
                 "resample_attempt": resample_attempt,
                 "patch_attempt": self.evo_config.max_patch_attempts,
                 "system_prompt_id": current_prompt_id,  # Track evolved prompt
+                **llm_kwargs,
+                "llm_result": response.to_dict() if "response" in locals() and response else None,
             }
 
             return None, meta_patch_data, False
@@ -3174,6 +3873,12 @@ class ShinkaEvolveRunner:
     async def _persist_program_metadata_async(self, program: Program) -> None:
         """Persist updated program metadata using a thread-local DB handle."""
         if not program.metadata:
+            return
+
+        if hasattr(self.async_db, "update_program_metadata_async"):
+            await self.async_db.update_program_metadata_async(
+                program.id, dict(program.metadata)
+            )
             return
 
         def update_metadata():
@@ -3223,6 +3928,151 @@ class ShinkaEvolveRunner:
             self.MAX_DB_RETRY_ATTEMPTS,
         )
 
+    async def _persist_failed_generation(
+        self,
+        *,
+        generation: int,
+        exec_fname: str,
+        proposal_started_at: float,
+        sampling_worker_id: Optional[int],
+        active_proposals_at_start: int,
+        parent_program: Optional[Program],
+        archive_programs: List[Program],
+        top_k_programs: List[Program],
+        code_diff: Optional[str],
+        meta_patch_data: Optional[Dict[str, Any]],
+        code_embedding: Optional[List[float]],
+        embed_cost: float,
+        novelty_cost: float,
+        api_costs: float,
+        failure_stage: str,
+        failure_reason: str,
+    ) -> Optional[Program]:
+        """Persist a pre-evaluation failure as an incorrect program row."""
+        sampling_finished_at = time.time()
+        postprocess_started_at = sampling_finished_at
+        postprocess_finished_at = postprocess_started_at
+        source_job_id = f"failed:{failure_stage}:{generation}"
+        try:
+            exec_path = Path(exec_fname)
+            code = ""
+            if exec_path.exists():
+                code = await self._read_file_async(exec_fname) or ""
+            failure_class = self._classify_failed_proposal(
+                failure_stage=failure_stage,
+                failure_reason=failure_reason,
+                meta_patch_data=meta_patch_data,
+            )
+            failure_json_path, failure_payload = await self._write_failure_artifact_async(
+                generation=generation,
+                exec_fname=exec_fname,
+                parent_program=parent_program,
+                archive_programs=archive_programs,
+                top_k_programs=top_k_programs,
+                meta_patch_data=meta_patch_data,
+                embed_cost=embed_cost,
+                novelty_cost=novelty_cost,
+                api_costs=api_costs,
+                failure_stage=failure_stage,
+                failure_class=failure_class,
+                failure_reason=failure_reason,
+                code_embedding=code_embedding,
+                proposal_started_at=proposal_started_at,
+                sampling_worker_id=sampling_worker_id,
+                active_proposals_at_start=active_proposals_at_start,
+            )
+            metadata = with_pipeline_timing(
+                {
+                    **(meta_patch_data or {}),
+                    "node_kind": "failed_proposal",
+                    "api_costs": api_costs,
+                    "embed_cost": embed_cost,
+                    "novelty_cost": novelty_cost,
+                    "failure_stage": failure_stage,
+                    "failure_class": failure_class,
+                    "failure_reason": failure_reason,
+                    "failure_persisted": True,
+                    "results_missing": True,
+                    "safe_processing": False,
+                    "downstream_eval_submitted": False,
+                    "failure_json_path": failure_json_path,
+                    "generated_code_available": bool(code.strip()),
+                    "failure_artifacts": failure_payload.get("artifacts", {}),
+                    "source_job_id": source_job_id,
+                    "source_generation": generation,
+                    "stdout_log": "",
+                    "stderr_log": failure_reason,
+                    "sampling_worker_id": sampling_worker_id,
+                    "evaluation_worker_id": None,
+                    "postprocess_worker_id": None,
+                    "active_proposals_at_start": active_proposals_at_start,
+                    "running_eval_jobs_at_submit": 0,
+                    "timeline_lane_mode": "pool_slots",
+                    "sampling_worker_capacity": self.max_proposal_jobs,
+                    "evaluation_worker_capacity": self.max_evaluation_jobs,
+                    "postprocess_worker_capacity": self.max_db_workers,
+                },
+                pipeline_started_at=proposal_started_at,
+                sampling_started_at=proposal_started_at,
+                sampling_finished_at=sampling_finished_at,
+                evaluation_started_at=sampling_finished_at,
+                evaluation_finished_at=sampling_finished_at,
+                postprocess_started_at=postprocess_started_at,
+                postprocess_finished_at=postprocess_finished_at,
+            )
+            program = Program(
+                id=str(uuid.uuid4()),
+                code=code,
+                generation=generation,
+                correct=False,
+                combined_score=0.0,
+                public_metrics={},
+                private_metrics={},
+                text_feedback=failure_reason,
+                timestamp=datetime.now().timestamp(),
+                parent_id=parent_program.id if parent_program else None,
+                archive_inspiration_ids=[p.id for p in archive_programs],
+                top_k_inspiration_ids=[p.id for p in top_k_programs],
+                code_diff=code_diff,
+                embedding=code_embedding or [],
+                system_prompt_id=(meta_patch_data or {}).get("system_prompt_id"),
+                metadata=metadata,
+            )
+
+            await self.async_db.add_program_async(
+                program,
+                parent_id=program.parent_id,
+                archive_insp_ids=program.archive_inspiration_ids,
+                top_k_insp_ids=program.top_k_inspiration_ids,
+                code_diff=program.code_diff,
+                meta_patch_data=meta_patch_data,
+                code_embedding=program.embedding,
+                embed_cost=embed_cost,
+                verbose=self.verbose,
+                defer_maintenance=True,
+            )
+
+            await self._update_completed_generations()
+            self._log_wandb_population_progress()
+            self._record_progress()
+            self.slot_available.set()
+            self._log_program_to_wandb(program)
+            logger.info(
+                "Persisted failed generation %s as incorrect program %s (%s)",
+                generation,
+                program.id,
+                failure_stage,
+            )
+            return program
+        except Exception as e:
+            logger.error(
+                "Failed to persist failed generation %s (%s): %r",
+                generation,
+                failure_stage,
+                e,
+            )
+            return None
+
     async def _persist_completed_job(
         self, job: AsyncRunningJob
     ) -> CompletedJobPersistResult:
@@ -3241,31 +4091,33 @@ class ShinkaEvolveRunner:
                 )
                 return CompletedJobPersistResult(job=job, success=True)
 
-            if await self.async_db.has_program_with_source_job_id_async(source_job_id):
-                logger.info(
-                    f"⏭️  SKIP DUPLICATE: Job {job.job_id} (gen {job.generation}) "
-                    "already persisted to database"
-                )
-                return CompletedJobPersistResult(job=job, success=True)
-
             # Get job results with timeout to prevent hanging
             try:
                 results = await asyncio.wait_for(
                     self.scheduler.get_job_results_async(job.job_id, job.results_dir),
                     timeout=30.0,  # 30 second timeout
                 )
-                evaluation_finished_at = time.time()
-                job.results_retrieved_at = evaluation_finished_at
+                results_retrieved_at = time.time()
+                if job.results_retrieved_at is None:
+                    job.results_retrieved_at = results_retrieved_at
+                evaluation_finished_at = (
+                    job.completion_detected_at or job.results_retrieved_at
+                )
                 logger.info(
                     f"📂 RESULTS: Got results for {job.job_id}: {results is not None}"
                 )
             except asyncio.TimeoutError:
                 logger.error(f"❌ TIMEOUT: Getting results for {job.job_id} timed out")
+                await self._record_generation_event(
+                    generation=job.generation,
+                    status="results_timeout",
+                    source_job_id=job.job_id,
+                )
                 return CompletedJobPersistResult(job=job, success=False)
             await self._release_evaluation_slot_once(job)
             postprocess_worker_id = await self.postprocess_slot_pool.acquire()
             db_workers_in_use_at_postprocess_start = self.postprocess_slot_pool.in_use
-            postprocess_started_at = evaluation_finished_at
+            postprocess_started_at = time.time()
 
             # Always create a program entry, even if results are missing
             if results:
@@ -3276,7 +4128,10 @@ class ShinkaEvolveRunner:
                 public_metrics = metrics_val.get("public", {})
                 private_metrics = metrics_val.get("private", {})
                 text_feedback = metrics_val.get("text_feedback", "")
-                stdout_log = results.get("stdout_log", "")
+                stdout_log = truncate_log_tail(
+                    results.get("stdout_log", ""),
+                    self.db_config.max_stdout_log_chars,
+                )
                 stderr_log = results.get("stderr_log", "")
 
                 logger.info(
@@ -3359,7 +4214,7 @@ class ShinkaEvolveRunner:
             )
 
             try:
-                await asyncio.wait_for(
+                added = await asyncio.wait_for(
                     self.async_db.add_program_async(
                         program,
                         parent_id=job.parent_id,
@@ -3369,12 +4224,120 @@ class ShinkaEvolveRunner:
                         meta_patch_data=job.meta_patch_data,
                         code_embedding=job.code_embedding,
                         embed_cost=job.embed_cost,
+                        verbose=self.verbose,
+                        defer_maintenance=True,
                     ),
-                    timeout=30.0,  # 30 second timeout for DB operations
+                    timeout=90.0,  # 90 second timeout for DB operations
                 )
-                logger.info(
-                    f"✅ DB SUCCESS: Program {program.id} successfully added to database for {job.job_id} (gen {job.generation})"
-                )
+                if added:
+                    logger.info(
+                        f"✅ DB SUCCESS: Program {program.id} successfully added to database for {job.job_id} (gen {job.generation})"
+                    )
+                else:
+                    existing_program = None
+                    if hasattr(self.async_db, "get_program_by_source_job_id_async"):
+                        existing_program = (
+                            await self.async_db.get_program_by_source_job_id_async(
+                                source_job_id
+                            )
+                        )
+
+                    if existing_program is None:
+                        self._queue_failed_db_job(
+                            job,
+                            log_prefix="⏳ DB STILL IN FLIGHT:",
+                            error_message=(
+                                "Program insert is still in flight for "
+                                f"{job.job_id}; will retry side effects"
+                            ),
+                        )
+                        return CompletedJobPersistResult(job=job, success=False)
+
+                    postprocess_finished_at = time.time()
+                    existing_metadata = existing_program.metadata or {}
+                    existing_program.metadata = with_pipeline_timing(
+                        existing_metadata,
+                        pipeline_started_at=float(
+                            existing_metadata.get(
+                                "pipeline_started_at", job.proposal_started_at
+                            )
+                        ),
+                        sampling_started_at=float(
+                            existing_metadata.get(
+                                "sampling_started_at", job.proposal_started_at
+                            )
+                        ),
+                        sampling_finished_at=float(
+                            existing_metadata.get(
+                                "sampling_finished_at", evaluation_started_at
+                            )
+                        ),
+                        evaluation_started_at=float(
+                            existing_metadata.get(
+                                "evaluation_started_at", evaluation_started_at
+                            )
+                        ),
+                        evaluation_finished_at=float(
+                            existing_metadata.get(
+                                "evaluation_finished_at", evaluation_finished_at
+                            )
+                        ),
+                        postprocess_started_at=float(
+                            existing_metadata.get(
+                                "postprocess_started_at", postprocess_started_at
+                            )
+                        ),
+                        postprocess_finished_at=max(
+                            float(
+                                existing_metadata.get(
+                                    "postprocess_finished_at", postprocess_started_at
+                                )
+                            ),
+                            postprocess_finished_at,
+                        ),
+                    )
+                    self._record_oversubscription_timing_sample(
+                        existing_program.metadata or {}
+                    )
+
+                    if (existing_program.metadata or {}).get(
+                        "postprocess_side_effects_applied"
+                    ):
+                        logger.info(
+                            "⏭️  SKIP DUPLICATE SIDE EFFECTS: Job %s already fully processed",
+                            job.job_id,
+                        )
+                        return CompletedJobPersistResult(job=job, success=True)
+
+                    logger.info(
+                        "♻️  REUSE DUPLICATE ROW: Job %s already persisted as program %s",
+                        job.job_id,
+                        existing_program.id,
+                    )
+                    return CompletedJobPersistResult(
+                        job=job,
+                        success=True,
+                        persisted_event=self._make_persisted_event(
+                            job=job,
+                            program=existing_program,
+                            evaluation_finished_at=float(
+                                (existing_program.metadata or {}).get(
+                                    "evaluation_finished_at", evaluation_finished_at
+                                )
+                            ),
+                            postprocess_started_at=float(
+                                (existing_program.metadata or {}).get(
+                                    "postprocess_started_at", postprocess_started_at
+                                )
+                            ),
+                            postprocess_finished_at=float(
+                                (existing_program.metadata or {}).get(
+                                    "postprocess_finished_at",
+                                    postprocess_finished_at,
+                                )
+                            ),
+                        ),
+                    )
 
             except asyncio.TimeoutError:
                 self._queue_failed_db_job(
@@ -3406,16 +4369,12 @@ class ShinkaEvolveRunner:
                 postprocess_started_at=postprocess_started_at,
                 postprocess_finished_at=postprocess_finished_at,
             )
-            try:
-                await self._persist_program_metadata_async(program)
-            except Exception as e:
-                logger.warning(f"Metadata persistence error for {job.job_id}: {e}")
             self._record_oversubscription_timing_sample(program.metadata or {})
 
             return CompletedJobPersistResult(
                 job=job,
                 success=True,
-                persisted_event=PersistedProgramEvent(
+                persisted_event=self._make_persisted_event(
                     job=job,
                     program=program,
                     evaluation_finished_at=evaluation_finished_at,
@@ -3443,63 +4402,82 @@ class ShinkaEvolveRunner:
         job = persisted_event.job
         program = persisted_event.program
         apply_started_at = time.time()
+        metadata_persist_needed = False
+        side_effects_completed = False
 
         try:
+            if hasattr(self.async_db, "run_program_maintenance_async"):
+                await self.async_db.run_program_maintenance_async(
+                    program,
+                    verbose=self.verbose,
+                )
+
             system_prompt_id = None
             if job.meta_patch_data:
                 system_prompt_id = job.meta_patch_data.get("system_prompt_id")
 
             # Update prompt fitness if prompt evolution is enabled
             if system_prompt_id and self.evo_config.evolve_prompts:
-                parent_score = 0.0
-                if job.parent_id:
-                    parent_program = await self.async_db.get_async(job.parent_id)
-                    if parent_program:
-                        parent_score = parent_program.combined_score or 0.0
+                prompt_lock = getattr(self, "_prompt_side_effect_lock", None)
+                if prompt_lock is None:
+                    prompt_lock = asyncio.Lock()
+                    self._prompt_side_effect_lock = prompt_lock
+                async with prompt_lock:
+                    parent_score = 0.0
+                    if job.parent_id:
+                        parent_program = await self.async_db.get_async(job.parent_id)
+                        if parent_program:
+                            parent_score = parent_program.combined_score or 0.0
 
-                program_score = program.combined_score or 0.0
-                improvement = program_score - parent_score
-                await self._update_prompt_fitness(
-                    system_prompt_id,
-                    program.id,
-                    program_score=program_score,
-                    improvement=improvement,
-                    correct=program.correct,
-                )
-                await self._maybe_evolve_prompt()
+                    program_score = program.combined_score or 0.0
+                    improvement = program_score - parent_score
+                    await self._update_prompt_fitness(
+                        system_prompt_id,
+                        program.id,
+                        program_score=program_score,
+                        improvement=improvement,
+                        correct=program.correct,
+                    )
+                    await self._maybe_evolve_prompt()
 
             if self.meta_summarizer:
                 try:
-                    self.meta_summarizer.add_evaluated_program(program)
+                    meta_lock = getattr(self, "_meta_side_effect_lock", None)
+                    if meta_lock is None:
+                        meta_lock = asyncio.Lock()
+                        self._meta_side_effect_lock = meta_lock
+                    async with meta_lock:
+                        self.meta_summarizer.add_evaluated_program(program)
 
-                    if self.meta_summarizer.should_update_meta(
-                        self.evo_config.meta_rec_interval
-                    ):
-                        logger.info("Updating meta memory...")
-                        best_program = await self.async_db.get_best_program_async()
-                        # Use async meta summarizer for non-blocking meta analysis
-                        (
-                            updated_recs,
-                            meta_cost,
-                        ) = await self.meta_summarizer.update_meta_memory_async(
-                            best_program
-                        )
-                        if updated_recs:
-                            # Write meta output file asynchronously
-                            await self.meta_summarizer.write_meta_output_async(
-                                str(self.results_dir)
+                        if self.meta_summarizer.should_update_meta(
+                            self.evo_config.meta_rec_interval
+                        ):
+                            logger.info("Updating meta memory...")
+                            best_program = await self.async_db.get_best_program_async()
+                            # Use async meta summarizer for non-blocking meta analysis
+                            (
+                                updated_recs,
+                                meta_cost,
+                            ) = await self.meta_summarizer.update_meta_memory_async(
+                                best_program
                             )
-                            if meta_cost > 0:
-                                logger.info(
-                                    f"Meta recommendation cost: ${meta_cost:.4f}"
+                            if updated_recs:
+                                # Write meta output file asynchronously
+                                await self.meta_summarizer.write_meta_output_async(
+                                    str(self.results_dir)
                                 )
-                                # Add meta cost to in-memory total for accurate budget tracking
-                                self.total_api_cost += meta_cost
+                                if meta_cost > 0:
+                                    logger.info(
+                                        f"Meta recommendation cost: ${meta_cost:.4f}"
+                                    )
+                                    # Add meta cost to in-memory total for accurate budget tracking
+                                    self.total_api_cost += meta_cost
 
-                                # Add meta cost to this program's metadata
-                                if program.metadata is None:
-                                    program.metadata = {}
-                                program.metadata["meta_cost"] = meta_cost
+                                    # Add meta cost to this program's metadata
+                                    if program.metadata is None:
+                                        program.metadata = {}
+                                    program.metadata["meta_cost"] = meta_cost
+                                    metadata_persist_needed = True
                 except Exception as e:
                     logger.warning(f"Meta summarizer error for {job.job_id}: {e}")
                     # Don't fail the whole job for meta summarizer issues
@@ -3531,21 +4509,73 @@ class ShinkaEvolveRunner:
                 logger.warning(f"Best solution update error for {job.job_id}: {e}")
                 # Don't fail the whole job for best solution update issues
 
-        finally:
-            apply_finished_at = time.time()
-            program.metadata = dict(program.metadata or {})
-            program.metadata["postprocess_apply_started_at"] = apply_started_at
-            program.metadata["postprocess_apply_finished_at"] = apply_finished_at
-            program.metadata["postprocess_apply_seconds"] = max(
-                0.0, apply_finished_at - apply_started_at
-            )
-            try:
-                await self._persist_program_metadata_async(program)
-            except Exception as e:
-                logger.warning(
-                    f"Apply-stage metadata persistence error for {job.job_id}: {e}"
-                )
+            side_effects_completed = True
 
+        finally:
+            if side_effects_completed:
+                base_metadata = program.metadata or {}
+                program.metadata = with_pipeline_timing(
+                    base_metadata,
+                    pipeline_started_at=float(
+                        base_metadata.get("pipeline_started_at", job.proposal_started_at)
+                    ),
+                    sampling_started_at=float(
+                        base_metadata.get("sampling_started_at", job.proposal_started_at)
+                    ),
+                    sampling_finished_at=float(
+                        base_metadata.get(
+                            "sampling_finished_at",
+                            job.evaluation_started_at
+                            or job.evaluation_submitted_at
+                            or job.proposal_started_at,
+                        )
+                    ),
+                    evaluation_started_at=float(
+                        base_metadata.get(
+                            "evaluation_started_at",
+                            job.evaluation_started_at
+                            or job.evaluation_submitted_at
+                            or job.proposal_started_at,
+                        )
+                    ),
+                    evaluation_finished_at=float(
+                        base_metadata.get(
+                            "evaluation_finished_at",
+                            persisted_event.evaluation_finished_at,
+                        )
+                    ),
+                    postprocess_started_at=float(
+                        base_metadata.get(
+                            "postprocess_started_at",
+                            persisted_event.postprocess_started_at,
+                        )
+                    ),
+                    postprocess_finished_at=max(
+                        float(
+                            base_metadata.get(
+                                "postprocess_finished_at",
+                                persisted_event.postprocess_finished_at,
+                            )
+                        ),
+                        float(persisted_event.postprocess_finished_at),
+                    ),
+                )
+                program.metadata = with_side_effect_timing(
+                    program.metadata,
+                    apply_started_at=apply_started_at,
+                    apply_finished_at=time.time(),
+                )
+                program.metadata["postprocess_side_effects_applied"] = True
+                metadata_persist_needed = True
+            if metadata_persist_needed:
+                try:
+                    await self._persist_program_metadata_async(program)
+                except Exception as e:
+                    logger.warning(
+                        f"Apply-stage metadata persistence error for {job.job_id}: {e}"
+                    )
+
+        self._log_program_to_wandb(program)
         logger.info(
             "✅ JOB COMPLETE: Finished processing %s - program %s added (gen %s)",
             job.job_id,
@@ -3553,58 +4583,318 @@ class ShinkaEvolveRunner:
             job.generation,
         )
 
-    async def _process_completed_jobs_safely(
+    def _make_persisted_event(
+        self,
+        job: AsyncRunningJob,
+        program: Program,
+        evaluation_finished_at: float,
+        postprocess_started_at: float,
+        postprocess_finished_at: float,
+    ) -> PersistedProgramEvent:
+        """Construct a persisted-program event for follow-up side effects."""
+        return PersistedProgramEvent(
+            job=job,
+            program=program,
+            evaluation_finished_at=evaluation_finished_at,
+            postprocess_started_at=postprocess_started_at,
+            postprocess_finished_at=postprocess_finished_at,
+        )
+
+    async def _mark_completed_jobs_detected(
         self, completed_jobs: List[AsyncRunningJob]
-    ):
-        """Persist completed jobs concurrently, then apply slower side effects."""
-        persist_tasks = [
-            asyncio.create_task(
-                self._persist_completed_job(job),
-                name=f"persist_completed_{job.generation}",
+    ) -> None:
+        """Stamp completion time and free eval slots before slower persistence."""
+        detected_at = time.time()
+        for job in completed_jobs:
+            if job.completion_detected_at is None:
+                job.completion_detected_at = detected_at
+            await self._release_evaluation_slot_once(job)
+        self.slot_available.set()
+
+    def _get_completed_job_work_count(self) -> int:
+        """Return queued completed-job persistence work plus the active batch."""
+        pending = int(getattr(self, "_completed_jobs_pending", 0) or 0)
+        if pending > 0:
+            return pending
+        return int(hasattr(self, "processing_lock") and self.processing_lock.locked())
+
+    def _schedule_completed_jobs_for_processing(
+        self, completed_jobs: List[AsyncRunningJob]
+    ) -> None:
+        """Persist completed jobs in the background without blocking monitoring."""
+        if not completed_jobs:
+            return
+
+        self._completed_jobs_pending = int(
+            getattr(self, "_completed_jobs_pending", 0)
+        ) + len(completed_jobs)
+        if getattr(self, "_completed_job_batch_tasks", None) is None:
+            self._completed_job_batch_tasks = set()
+        task = asyncio.create_task(
+            self._process_completed_job_batch(completed_jobs),
+            name=(
+                "completed_job_batch_"
+                + "_".join(str(job.generation) for job in completed_jobs[:3])
+            ),
+        )
+        self._completed_job_batch_tasks.add(task)
+
+        def _cleanup(finished_task: asyncio.Task) -> None:
+            self._completed_job_batch_tasks.discard(finished_task)
+            try:
+                exc = finished_task.exception()
+            except asyncio.CancelledError:
+                return
+            if exc is not None:
+                logger.error("Completed-job batch task failed: %s", exc)
+
+        task.add_done_callback(_cleanup)
+
+    async def _process_completed_job_batch(
+        self, completed_jobs: List[AsyncRunningJob]
+    ) -> None:
+        """Serialize batch persistence while allowing the monitor to keep polling."""
+        old_retry_count = len(self.failed_jobs_for_retry)
+        old_completed = self.completed_generations
+        try:
+            async with self.processing_lock:
+                self._mark_surplus_completed_jobs_for_discard(completed_jobs)
+                await self._process_completed_jobs_safely(completed_jobs)
+                await self._update_completed_generations()
+                self._log_wandb_population_progress()
+                self.slot_available.set()
+        finally:
+            self._completed_jobs_pending = max(
+                0,
+                int(getattr(self, "_completed_jobs_pending", 0))
+                - len(completed_jobs),
             )
-            for job in completed_jobs
-        ]
 
-        persist_results = await asyncio.gather(*persist_tasks, return_exceptions=True)
-        successfully_processed: List[AsyncRunningJob] = []
-        persisted_events: List[PersistedProgramEvent] = []
+        self._record_progress()
 
-        for job, result in zip(completed_jobs, persist_results):
-            if isinstance(result, Exception):
-                logger.error(
-                    "❌ CRITICAL: Exception processing job %s (gen %s): %s",
-                    job.job_id,
-                    job.generation,
-                    result,
+        if not self.verbose:
+            return
+
+        if self.completed_generations != old_completed:
+            if self.evo_config.max_api_costs is not None:
+                cost_str = (
+                    f"${self.total_api_cost:.4f}/"
+                    f"${self.evo_config.max_api_costs:.2f}"
                 )
-                continue
+                cost_pct = (
+                    self.total_api_cost / self.evo_config.max_api_costs
+                ) * 100
+                cost_info = f" (cost: {cost_str}, {cost_pct:.1f}%)"
+            else:
+                cost_info = f" (cost: ${self.total_api_cost:.4f})"
 
-            if result.success:
-                successfully_processed.append(job)
-                self.submitted_jobs.pop(str(job.job_id), None)
-                if result.persisted_event is not None:
-                    persisted_events.append(result.persisted_event)
-                continue
+            logger.info(
+                f"✅ Completed generations updated: "
+                f"{old_completed} -> {self.completed_generations}{cost_info}"
+            )
+            return
 
-            logger.error(
-                "❌ CRITICAL: Failed to process job %s (gen %s)",
-                job.job_id,
-                job.generation,
+        retry_count = len(self.failed_jobs_for_retry)
+        new_retries = retry_count - old_retry_count
+        running_count = len(self.running_jobs)
+        at_target = self.completed_generations >= self.evo_config.num_generations
+
+        if at_target:
+            logger.debug(
+                f"📊 Completed generations at target: {self.completed_generations}"
+            )
+        elif new_retries > 0:
+            if self.evo_config.max_api_costs is not None:
+                cost_str = (
+                    f"${self.total_api_cost:.4f}/"
+                    f"${self.evo_config.max_api_costs:.2f}"
+                )
+                cost_pct = (
+                    self.total_api_cost / self.evo_config.max_api_costs
+                ) * 100
+                cost_info = f", cost: {cost_str} ({cost_pct:.1f}%)"
+            else:
+                cost_info = f", cost: ${self.total_api_cost:.4f}"
+
+            logger.info(
+                f"📊 Completed generations: "
+                f"{self.completed_generations} "
+                f"({new_retries} new jobs in retry queue, "
+                f"{retry_count} total pending retry{cost_info})"
+            )
+        elif retry_count > 0 or running_count > 0:
+            logger.debug(
+                f"📊 Completed generations: "
+                f"{self.completed_generations} "
+                f"(running={running_count}, retry={retry_count})"
+            )
+        else:
+            logger.warning(
+                f"⚠️  Completed generations unchanged after processing jobs: "
+                f"{self.completed_generations}"
             )
 
-        await self._update_completed_generations()
+    async def _wait_for_completed_job_batches(self) -> None:
+        """Wait until all queued completed-job persistence batches have drained."""
+        while getattr(self, "_completed_job_batch_tasks", set()):
+            tasks = list(self._completed_job_batch_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-        for persisted_event in sorted(
-            persisted_events, key=lambda event: event.job.generation
-        ):
+    async def _cancel_completed_job_batches(self) -> None:
+        """Cancel background completed-job persistence during exceptional shutdown."""
+        tasks = list(getattr(self, "_completed_job_batch_tasks", set()))
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._completed_job_batch_tasks.clear()
+        self._completed_jobs_pending = 0
+
+    async def _ensure_background_side_effect_worker(self) -> None:
+        """Start the background side-effect worker pool if needed."""
+        tasks = {
+            task
+            for task in getattr(self, "_background_side_effect_tasks", set())
+            if not task.done()
+        }
+        self._background_side_effect_tasks = tasks
+
+        if getattr(self, "side_effect_event_queue", None) is None:
+            self.side_effect_event_queue = asyncio.Queue()
+
+        target_workers = max(1, int(getattr(self, "max_db_workers", 1) or 1))
+        while len(tasks) < target_workers:
+            task = asyncio.create_task(
+                self._background_side_effect_worker_loop(),
+                name=f"background_side_effects_{len(tasks) + 1}",
+            )
+            tasks.add(task)
+
+        self._background_side_effect_task = next(iter(tasks), None)
+
+    def _get_background_side_effect_work_count(self) -> int:
+        """Return queued side effects plus the currently running one."""
+        pending = int(getattr(self, "_background_side_effects_pending", 0) or 0)
+        busy = int(getattr(self, "_background_side_effects_busy_count", 0) or 0)
+        if busy == 0:
+            busy = int(bool(getattr(self, "_background_side_effects_busy", False)))
+        return max(pending, busy)
+
+    async def _enqueue_background_side_effects(
+        self, persisted_events: List[PersistedProgramEvent]
+    ) -> None:
+        """Queue persisted events so slow side effects do not block persistence."""
+        if not persisted_events:
+            return
+
+        await self._ensure_background_side_effect_worker()
+        self._background_side_effects_pending = int(
+            getattr(self, "_background_side_effects_pending", 0)
+        )
+
+        for persisted_event in persisted_events:
+            self._background_side_effects_pending += 1
+            await self.side_effect_event_queue.put(persisted_event)
+
+        logger.debug(
+            "Queued %s persisted side-effect event(s); backlog=%s",
+            len(persisted_events),
+            self._background_side_effects_pending,
+        )
+
+    async def _background_side_effect_worker_loop(self) -> None:
+        """Drain side effects in generation order without blocking completions."""
+        while True:
+            persisted_event = await self.side_effect_event_queue.get()
+            if persisted_event is None:
+                self.side_effect_event_queue.task_done()
+                break
+
+            self._background_side_effects_busy_count = (
+                int(getattr(self, "_background_side_effects_busy_count", 0)) + 1
+            )
+            self._background_side_effects_busy = True
             try:
                 await self._apply_persisted_program_side_effects(persisted_event)
+                self._record_progress()
             except Exception as e:
                 logger.error(
                     "❌ APPLY ERROR: Side effects failed for job %s (gen %s): %s",
                     persisted_event.job.job_id,
                     persisted_event.job.generation,
                     e,
+                )
+            finally:
+                self._background_side_effects_busy_count = max(
+                    0,
+                    int(getattr(self, "_background_side_effects_busy_count", 0)) - 1,
+                )
+                self._background_side_effects_busy = (
+                    self._background_side_effects_busy_count > 0
+                )
+                self._background_side_effects_pending = max(
+                    0,
+                    int(getattr(self, "_background_side_effects_pending", 0)) - 1,
+                )
+                self.side_effect_event_queue.task_done()
+
+    async def _wait_for_background_side_effects(self) -> None:
+        """Wait until the background side-effect backlog has drained."""
+        queue = getattr(self, "side_effect_event_queue", None)
+        if queue is None:
+            return
+        await queue.join()
+
+    async def _shutdown_background_side_effect_worker(self) -> None:
+        """Gracefully stop the background side-effect worker pool after draining."""
+        tasks = {
+            task
+            for task in getattr(self, "_background_side_effect_tasks", set())
+            if not task.done()
+        }
+        if not tasks:
+            return
+
+        await self._wait_for_background_side_effects()
+        for _ in tasks:
+            await self.side_effect_event_queue.put(None)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_side_effect_tasks.clear()
+        self._background_side_effect_task = None
+
+    async def _cancel_background_side_effect_worker(self) -> None:
+        """Cancel the background side-effect worker pool during exceptional shutdown."""
+        tasks = list(getattr(self, "_background_side_effect_tasks", set()))
+        if not tasks:
+            return
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_side_effect_tasks.clear()
+        self._background_side_effect_task = None
+
+    async def _process_completed_jobs_safely(
+        self, completed_jobs: List[AsyncRunningJob]
+    ):
+        """Process completed jobs inline, closer to the amd_shinka execution model."""
+        successfully_processed: List[AsyncRunningJob] = []
+
+        for job in completed_jobs:
+            try:
+                success = await self._process_single_job_safely(job)
+                if success:
+                    successfully_processed.append(job)
+                    if str(job.job_id) in self.submitted_jobs:
+                        del self.submitted_jobs[str(job.job_id)]
+                else:
+                    logger.error(
+                        f"❌ CRITICAL: Failed to process job {job.job_id} (gen {job.generation})"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"❌ CRITICAL: Exception processing job {job.job_id} (gen {job.generation}): {e}"
                 )
 
         logger.info(
@@ -3629,21 +4919,10 @@ class ShinkaEvolveRunner:
         if not persist_result.success:
             return False
 
-        self.submitted_jobs.pop(str(job.job_id), None)
         if persist_result.persisted_event is None:
             return True
 
-        try:
-            await self._apply_persisted_program_side_effects(
-                persist_result.persisted_event
-            )
-        except Exception as e:
-            logger.error(
-                "❌ APPLY ERROR: Side effects failed for job %s (gen %s): %s",
-                job.job_id,
-                job.generation,
-                e,
-            )
+        await self._apply_persisted_program_side_effects(persist_result.persisted_event)
         return True
 
     async def _process_completed_jobs(self, completed_jobs: List[AsyncRunningJob]):
@@ -3688,6 +4967,10 @@ class ShinkaEvolveRunner:
                     # Also remove from submitted_jobs
                     if str(job.job_id) in self.submitted_jobs:
                         del self.submitted_jobs[str(job.job_id)]
+                    await self._update_completed_generations()
+                    self._log_wandb_population_progress()
+                    self._record_progress()
+                    self.slot_available.set()
                     logger.info(
                         f"✅ RETRY SUCCESS: Job {job.job_id} "
                         f"(gen {job.generation}) "
@@ -3726,6 +5009,12 @@ class ShinkaEvolveRunner:
         completed_generations = max(0, total_programs - island_copies)
         return min(completed_generations, self.evo_config.num_generations)
 
+    async def _get_missing_persisted_generations(self) -> List[int]:
+        """Return budgeted generations that do not yet have persisted rows."""
+        persisted_generations = await self.async_db.get_persisted_generation_ids_async()
+        budgeted_generations = set(range(self.evo_config.num_generations))
+        return sorted(budgeted_generations - set(persisted_generations))
+
     async def _restore_resume_progress(self) -> None:
         """Restore progress counters from persisted database state."""
         self.completed_generations = await self._count_completed_generations_from_db()
@@ -3737,7 +5026,16 @@ class ShinkaEvolveRunner:
             len(self.running_jobs)
             + len(self.active_proposal_tasks)
             + len(self.failed_jobs_for_retry)
+            + self._get_completed_job_work_count()
         )
+
+    def _has_background_side_effect_work(self) -> bool:
+        """Return whether background side effects are still queued or running."""
+        return self._get_background_side_effect_work_count() > 0
+
+    def _has_persistence_work_in_progress(self) -> bool:
+        """Return whether persistence or retry bookkeeping is still active."""
+        return self._get_in_flight_work_count() > 0
 
     def _get_remaining_completed_work(self) -> int:
         """Return how many completed generations are still needed."""
@@ -3792,8 +5090,6 @@ class ShinkaEvolveRunner:
         self.assigned_generations.discard(generation)
         if task_id in self.active_proposal_tasks:
             del self.active_proposal_tasks[task_id]
-        if sampling_worker_id is not None:
-            await self.sampling_slot_pool.release(sampling_worker_id)
 
     async def _release_evaluation_slot_once(self, job: AsyncRunningJob) -> None:
         """Release an evaluation slot at most once per job."""
@@ -3866,7 +5162,7 @@ class ShinkaEvolveRunner:
         and progress tracking, what matters is the total count of completed work,
         not whether it's contiguous. This counts all generations that have:
         1. No running jobs AND
-        2. Programs in the database (successful evaluation)
+        2. Programs in the database (successful or persisted-failed generations)
         """
         # Get all generations that have running jobs
         running_generations = {job.generation for job in self.running_jobs}
@@ -4027,6 +5323,12 @@ class ShinkaEvolveRunner:
 
         # Don't consider system stuck if we're waiting for cost-limited jobs
         if self.cost_limit_reached and running_eval_jobs > 0:
+            return False
+
+        if self._has_persistence_work_in_progress():
+            return False
+
+        if self._has_background_side_effect_work():
             return False
 
         # System is stuck if all conditions are met
@@ -4257,6 +5559,7 @@ class ShinkaEvolveRunner:
                     logger.warning(f"Failed to recompute prompt percentiles: {e}")
 
             # Cleanup database
+            await self._finish_wandb_logging()
             await self.async_db.close_async()
 
             # Cleanup scheduler
@@ -4265,6 +5568,337 @@ class ShinkaEvolveRunner:
         except Exception as e:
             logger.error(f"Error in async cleanup: {e}")
 
+    def _log_program_to_wandb(self, program: Program) -> None:
+        wandb_logger = getattr(self, "wandb_logger", None)
+        if (
+            wandb_logger is not None
+            and getattr(wandb_logger, "active", True)
+            and not is_island_copy(program)
+            and hasattr(wandb_logger, "log_program_payload")
+        ):
+            self._enqueue_wandb_candidate(
+                wandb_logger.log_program_payload,
+                program.id,
+                build_program_log_payload(program),
+            )
+
+    def _log_wandb_population_progress(self) -> None:
+        wandb_logger = getattr(self, "wandb_logger", None)
+        db = getattr(self, "db", None)
+        if (
+            wandb_logger is None
+            or db is None
+            or getattr(wandb_logger, "active", True) is False
+        ):
+            return
+
+        snapshot_task = getattr(self, "_wandb_population_task", None)
+        delay_task = getattr(self, "_wandb_population_delay_task", None)
+        snapshot_running = snapshot_task is not None and not snapshot_task.done()
+        delay_running = delay_task is not None and not delay_task.done()
+        if snapshot_running or delay_running:
+            self._wandb_population_pending = True
+            return
+
+        loop = asyncio.get_running_loop()
+        last_snapshot_at = getattr(
+            self, "_wandb_last_population_snapshot_at", None
+        )
+        interval = getattr(
+            self,
+            "_wandb_population_interval_seconds",
+            _WANDB_POPULATION_INTERVAL_SECONDS,
+        )
+        delay = (
+            0.0
+            if last_snapshot_at is None
+            else max(0.0, interval - (loop.time() - last_snapshot_at))
+        )
+        if delay:
+            self._wandb_population_pending = True
+            self._wandb_population_delay_task = asyncio.create_task(
+                self._run_delayed_wandb_population_snapshot(delay),
+                name="wandb_population_delay",
+            )
+            return
+        self._start_wandb_population_snapshot(wandb_logger, db)
+
+    def _start_wandb_population_snapshot(
+        self, wandb_logger: Any, db: ProgramDatabase
+    ) -> None:
+        try:
+            population_snapshot = self._capture_wandb_population_snapshot(db)
+        except Exception as exc:
+            logger.warning(
+                "Failed to query in-memory W&B population snapshot: %s", exc
+            )
+            return
+        if population_snapshot is None:
+            if not hasattr(wandb_logger, "log_population_progress"):
+                return
+        elif not hasattr(wandb_logger, "log_population_snapshot"):
+            return
+        else:
+            self._wandb_last_population_snapshot_at = (
+                asyncio.get_running_loop().time()
+            )
+
+        self._wandb_population_pending = False
+        self._wandb_population_task = asyncio.create_task(
+            self._run_wandb_population_snapshot(
+                wandb_logger, db, population_snapshot
+            ),
+            name="wandb_population_snapshot",
+        )
+
+    async def _run_delayed_wandb_population_snapshot(self, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        finally:
+            self._wandb_population_delay_task = None
+        wandb_logger = getattr(self, "wandb_logger", None)
+        db = getattr(self, "db", None)
+        if (
+            wandb_logger is not None
+            and db is not None
+            and getattr(wandb_logger, "active", True)
+        ):
+            self._start_wandb_population_snapshot(wandb_logger, db)
+
+    async def _run_wandb_population_snapshot(
+        self,
+        wandb_logger: Any,
+        db: ProgramDatabase,
+        population_snapshot: Optional[List[Dict[str, Any]]],
+    ) -> None:
+        try:
+            if population_snapshot is None:
+                await self._run_wandb_operation(
+                    self._log_wandb_population_snapshot,
+                    wandb_logger,
+                    db,
+                )
+            else:
+                await self._run_wandb_operation(
+                    wandb_logger.log_population_snapshot,
+                    population_snapshot,
+                )
+        except Exception as exc:
+            logger.warning("Failed to run background W&B snapshot: %s", exc)
+        finally:
+            if population_snapshot is None:
+                self._wandb_last_population_snapshot_at = (
+                    asyncio.get_running_loop().time()
+                )
+            self._wandb_population_task = None
+        if self._wandb_population_pending:
+            self._wandb_population_pending = False
+            self._log_wandb_population_progress()
+
+    async def _wait_for_wandb_population_progress(self) -> None:
+        while (
+            task := getattr(self, "_wandb_population_task", None)
+            or getattr(self, "_wandb_population_delay_task", None)
+        ) is not None:
+            await asyncio.shield(task)
+
+    async def _skip_delayed_wandb_population_progress(self) -> None:
+        delay_task = getattr(self, "_wandb_population_delay_task", None)
+        if delay_task is not None:
+            delay_task.cancel()
+            try:
+                await delay_task
+            except asyncio.CancelledError:
+                pass
+            self._wandb_population_delay_task = None
+        self._wandb_population_pending = False
+        while (task := getattr(self, "_wandb_population_task", None)) is not None:
+            await asyncio.shield(task)
+
+    @staticmethod
+    def _capture_wandb_population_snapshot(
+        db: ProgramDatabase,
+    ) -> Optional[List[Dict[str, Any]]]:
+        config = getattr(db, "config", None)
+        if config is None or getattr(config, "db_path", None):
+            return None
+        return db.get_population_telemetry()
+
+    @staticmethod
+    def _wandb_snapshot_db(db: ProgramDatabase) -> Tuple[ProgramDatabase, bool]:
+        config = getattr(db, "config", None)
+        db_path = getattr(config, "db_path", None)
+        if not db_path:
+            return db, False
+        return ProgramDatabase(config, read_only=True), True
+
+    @classmethod
+    def _log_wandb_population_snapshot(
+        cls, wandb_logger: Any, db: ProgramDatabase
+    ) -> None:
+        snapshot_db, should_close = cls._wandb_snapshot_db(db)
+        try:
+            wandb_logger.log_population_progress(db=snapshot_db)
+        finally:
+            if should_close:
+                snapshot_db.close()
+
+    @classmethod
+    def _log_final_wandb_snapshot(
+        cls,
+        wandb_logger: Any,
+        db: ProgramDatabase,
+        total_proposals_generated: Optional[int],
+        total_cost: Optional[float],
+    ) -> None:
+        snapshot_db, should_close = cls._wandb_snapshot_db(db)
+        try:
+            wandb_logger.log_final(
+                db=snapshot_db,
+                total_proposals_generated=total_proposals_generated,
+                total_api_cost=total_cost,
+                total_cost=total_cost,
+            )
+        finally:
+            if should_close:
+                snapshot_db.close()
+
+    async def _finish_wandb_logging(self) -> None:
+        wandb_logger = getattr(self, "wandb_logger", None)
+        if wandb_logger is None:
+            return
+        await self._skip_delayed_wandb_population_progress()
+        await self._drain_wandb_candidate_queue()
+        total_cost = getattr(self, "total_api_cost", None)
+        db = getattr(self, "db", None)
+        if db is not None:
+            try:
+                config = getattr(db, "config", None)
+                if config is not None and not getattr(config, "db_path", None):
+                    programs = db.get_all_programs()
+                    await self._run_wandb_operation(
+                        wandb_logger.log_final_programs,
+                        programs,
+                        total_proposals_generated=getattr(
+                            self, "total_proposals_generated", None
+                        ),
+                        total_api_cost=total_cost,
+                        total_cost=total_cost,
+                    )
+                else:
+                    await self._run_wandb_operation(
+                        self._log_final_wandb_snapshot,
+                        wandb_logger,
+                        db,
+                        getattr(self, "total_proposals_generated", None),
+                        total_cost,
+                    )
+            except Exception as exc:
+                logger.warning("Failed to run final W&B snapshot: %s", exc)
+        try:
+            await self._run_wandb_operation(wandb_logger.finish)
+        finally:
+            await self._stop_wandb_candidate_worker()
+            await self._shutdown_wandb_executor()
+
+    def _wandb_thread_pool(self) -> ThreadPoolExecutor:
+        executor = getattr(self, "_wandb_executor", None)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="shinka-wandb",
+            )
+            self._wandb_executor = executor
+        return executor
+
+    async def _run_wandb_operation(
+        self, callback: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        loop = asyncio.get_running_loop()
+        operation = partial(callback, *args, **kwargs)
+        return await loop.run_in_executor(self._wandb_thread_pool(), operation)
+
+    def _wandb_candidate_event_queue(self) -> asyncio.Queue:
+        queue = getattr(self, "_wandb_candidate_queue", None)
+        if queue is None:
+            queue = asyncio.Queue(
+                maxsize=getattr(
+                    self,
+                    "_wandb_candidate_queue_size",
+                    _WANDB_CANDIDATE_QUEUE_SIZE,
+                )
+            )
+            self._wandb_candidate_queue = queue
+        return queue
+
+    def _enqueue_wandb_candidate(
+        self, callback: Any, program_id: str, payload: Dict[str, Any]
+    ) -> None:
+        queue = self._wandb_candidate_event_queue()
+        if queue.full():
+            self._wandb_dropped_candidate_events = (
+                getattr(self, "_wandb_dropped_candidate_events", 0) + 1
+            )
+            now = time.monotonic()
+            last_warning = getattr(self, "_wandb_last_drop_warning_at", None)
+            if (
+                last_warning is None
+                or now - last_warning >= _WANDB_DROP_WARNING_INTERVAL_SECONDS
+            ):
+                logger.warning(
+                    "W&B candidate queue full; dropping newest candidate event. "
+                    "Population and final snapshots remain authoritative."
+                )
+                self._wandb_last_drop_warning_at = now
+            return
+        queue.put_nowait((callback, program_id, payload))
+        worker = getattr(self, "_wandb_candidate_worker_task", None)
+        if worker is None or worker.done():
+            self._wandb_candidate_worker_task = asyncio.create_task(
+                self._run_wandb_candidate_worker(),
+                name="wandb_candidate_worker",
+            )
+
+    async def _run_wandb_candidate_worker(self) -> None:
+        queue = self._wandb_candidate_event_queue()
+        while True:
+            operation = await queue.get()
+            try:
+                if operation is _WANDB_CANDIDATE_STOP:
+                    return
+                callback, program_id, payload = operation
+                try:
+                    await self._run_wandb_operation(
+                        callback, program_id, payload
+                    )
+                except Exception as exc:
+                    logger.warning("Failed W&B candidate operation: %s", exc)
+            finally:
+                queue.task_done()
+
+    async def _drain_wandb_candidate_queue(self) -> None:
+        queue = getattr(self, "_wandb_candidate_queue", None)
+        if queue is not None:
+            await queue.join()
+
+    async def _stop_wandb_candidate_worker(self) -> None:
+        worker = getattr(self, "_wandb_candidate_worker_task", None)
+        if worker is None:
+            return
+        queue = self._wandb_candidate_event_queue()
+        queue.put_nowait(_WANDB_CANDIDATE_STOP)
+        await worker
+        self._wandb_candidate_worker_task = None
+
+    async def _shutdown_wandb_executor(self) -> None:
+        executor = getattr(self, "_wandb_executor", None)
+        if executor is None:
+            return
+        self._wandb_executor = None
+        await asyncio.to_thread(executor.shutdown, True)
+
     async def _print_final_summary(self):
         """Print final evolution summary."""
         if not self.verbose:
@@ -4272,11 +5906,23 @@ class ShinkaEvolveRunner:
 
         end_time = time.time()
         total_time = end_time - (self.start_time or end_time)
+        missing_generations = (
+            self._get_generations_without_program_due_to_proposal_failure()
+        )
 
         logger.info("=" * 80)
         logger.info("ASYNC EVOLUTION COMPLETED")
         logger.info("=" * 80)
-        logger.info(f"Total generations: {self.completed_generations}")
+        logger.info(f"Target generations: {self.evo_config.num_generations}")
+        logger.info(f"Stored programs: {self.completed_generations}")
+        logger.info(
+            "Generations without program (proposal generation exhausted retries): %s",
+            len(missing_generations),
+        )
+        logger.info(
+            "Generation IDs without program after proposal retries: %s",
+            missing_generations,
+        )
         logger.info(f"Total proposals generated: {self.total_proposals_generated}")
         logger.info(f"Total API cost: ${self.total_api_cost:.4f}")
 
@@ -4313,7 +5959,120 @@ class ShinkaEvolveRunner:
         # Print database summary
         if self.db:
             logger.info("-" * 40)
-            self.db.print_summary(console=self.console)
+            self._log_timing_bottleneck_summary()
+            self.db.print_summary(
+                console=self.console,
+                total_program_target=self.evo_config.num_generations,
+            )
+
+    def _log_timing_bottleneck_summary(self) -> None:
+        """Print aggregate timing stats to identify queueing bottlenecks."""
+        if not self.db:
+            return
+
+        try:
+            programs = [
+                program
+                for program in self.db.get_all_programs()
+                if program.generation > 0 and isinstance(program.metadata, dict)
+            ]
+            if not programs:
+                return
+
+            metadata_rows = [program.metadata or {} for program in programs]
+            metrics = [
+                "sampling_seconds",
+                "evaluation_seconds",
+                "post_eval_queue_wait_seconds",
+                "postprocess_seconds",
+                "postprocess_apply_wait_seconds",
+                "postprocess_apply_seconds",
+                "pipeline_unaccounted_seconds",
+                "end_to_end_with_side_effects_seconds",
+            ]
+            summary = summarize_timing_metadata(metadata_rows, metrics)
+            if not summary:
+                return
+
+            label_map = {
+                "sampling_seconds": "Sampling",
+                "evaluation_seconds": "Evaluation",
+                "post_eval_queue_wait_seconds": "Eval->Postprocess Wait",
+                "postprocess_seconds": "Postprocess Hot Path",
+                "postprocess_apply_wait_seconds": "Postprocess->Apply Wait",
+                "postprocess_apply_seconds": "Side-Effect Apply",
+                "pipeline_unaccounted_seconds": "Pipeline Unaccounted",
+                "end_to_end_with_side_effects_seconds": "End-to-End w/ Side Effects",
+            }
+
+            logger.info("-" * 40)
+            logger.info("TIMING BOTTLENECK SUMMARY:")
+            logger.info(
+                "Programs analyzed: %s (generation > 0 with persisted metadata)",
+                len(programs),
+            )
+            for metric in metrics:
+                stats = summary.get(metric)
+                if not stats:
+                    continue
+                logger.info(
+                    "%s: mean=%.2fs median=%.2fs p90=%.2fs max=%.2fs (n=%d)",
+                    label_map[metric],
+                    stats["mean"],
+                    stats["median"],
+                    stats["p90"],
+                    stats["max"],
+                    int(stats["count"]),
+                )
+
+            for metric, label in [
+                ("post_eval_queue_wait_seconds", "Top Eval->Postprocess Waits"),
+                ("postprocess_apply_wait_seconds", "Top Postprocess->Apply Waits"),
+                ("postprocess_apply_seconds", "Top Side-Effect Apply Durations"),
+            ]:
+                ranked = []
+                for program in programs:
+                    value = (program.metadata or {}).get(metric)
+                    if isinstance(value, (int, float)) and value > 0:
+                        ranked.append((float(value), program.generation))
+                if not ranked:
+                    continue
+                top_rows = ", ".join(
+                    f"gen {generation}={value:.1f}s"
+                    for value, generation in sorted(ranked, reverse=True)[:5]
+                )
+                logger.info("%s: %s", label, top_rows)
+        except Exception as e:
+            logger.warning(f"Failed to compute timing bottleneck summary: {e}")
+
+    def _get_generations_without_program_due_to_proposal_failure(self) -> List[int]:
+        """Return target-range generation IDs that exhausted proposal retries and produced no program row."""
+        if not self.db or not getattr(self.db, "cursor", None):
+            return []
+
+        try:
+            self.db.cursor.execute(
+                """
+                SELECT DISTINCT attempt_log.generation
+                FROM attempt_log
+                WHERE attempt_log.status = 'failed'
+                  AND json_valid(attempt_log.details)
+                  AND json_extract(attempt_log.details, '$.node_kind') = 'failed_proposal'
+                  AND attempt_log.generation < ?
+                  AND attempt_log.generation NOT IN (
+                      SELECT DISTINCT generation FROM programs
+                  )
+                ORDER BY attempt_log.generation
+                """,
+                (self.evo_config.num_generations,),
+            )
+            return [int(row[0]) for row in self.db.cursor.fetchall()]
+        except Exception as e:
+            logger.warning(
+                "Failed to load proposal-failure generations without program rows: %s",
+                e,
+            )
+            return []
 
     def _print_metadata_table(self, meta_data: dict, generation: int = None):
         """Display metadata in a formatted rich table."""
@@ -4421,42 +6180,48 @@ class ShinkaEvolveRunner:
         """Checks and updates the best program asynchronously."""
         if not self.async_db:
             return
-        best_programs = await self.async_db.get_top_programs_async(
-            n=1, correct_only=True
-        )
-        if not best_programs:
+        best_lock = getattr(self, "_best_solution_lock", None)
+        if best_lock is None:
+            best_lock = asyncio.Lock()
+            self._best_solution_lock = best_lock
+
+        async with best_lock:
+            best_programs = await self.async_db.get_top_programs_async(
+                n=1, correct_only=True
+            )
+            if not best_programs:
+                if self.verbose:
+                    logger.info(
+                        "No correct programs found yet, cannot determine best solution."
+                    )
+                return
+
+            best_program = best_programs[0]
+
+            if best_program.id == self.best_program_id:
+                return  # No change
+
+            self.best_program_id = best_program.id
+
+            source_dir = f"{self.results_dir}/{FOLDER_PREFIX}_{best_program.generation}"
+            best_dir = Path(self.results_dir) / "best"
+
+            loop = asyncio.get_event_loop()
+
+            def sync_file_operations():
+                """Synchronous file operations to run in executor."""
+                if best_dir.exists():
+                    shutil.rmtree(best_dir)
+                shutil.copytree(source_dir, best_dir)
+
+            await loop.run_in_executor(None, sync_file_operations)
+
             if self.verbose:
                 logger.info(
-                    "No correct programs found yet, cannot determine best solution."
+                    f"New best program found: gen {best_program.generation}, "
+                    f"id {best_program.id[:6]}... "
+                    f"Copied to {best_dir}"
                 )
-            return
-
-        best_program = best_programs[0]
-
-        if best_program.id == self.best_program_id:
-            return  # No change
-
-        self.best_program_id = best_program.id
-
-        source_dir = f"{self.results_dir}/{FOLDER_PREFIX}_{best_program.generation}"
-        best_dir = Path(self.results_dir) / "best"
-
-        loop = asyncio.get_event_loop()
-
-        def sync_file_operations():
-            """Synchronous file operations to run in executor."""
-            if best_dir.exists():
-                shutil.rmtree(best_dir)
-            shutil.copytree(source_dir, best_dir)
-
-        await loop.run_in_executor(None, sync_file_operations)
-
-        if self.verbose:
-            logger.info(
-                f"New best program found: gen {best_program.generation}, "
-                f"id {best_program.id[:6]}... "
-                f"Copied to {best_dir}"
-            )
 
     def _extract_code_from_response(self, response_content: str) -> Optional[str]:
         """Extract code from LLM response."""
@@ -4478,7 +6243,7 @@ class ShinkaEvolveRunner:
         try:
 
             def read_file():
-                with open(file_path, "r") as f:
+                with open(file_path, "r", encoding="utf-8") as f:
                     return f.read()
 
             loop = asyncio.get_event_loop()

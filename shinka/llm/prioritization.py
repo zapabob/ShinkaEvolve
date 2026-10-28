@@ -8,6 +8,8 @@ import rich.box
 import pickle
 from pathlib import Path
 
+from shinka.local_openai_config import parse_local_openai_model
+
 Arm = Union[int, str]
 Subset = Optional[Union[np.ndarray, Sequence[Arm]]]
 
@@ -32,6 +34,37 @@ def _logexpm1(z):
     z = np.asarray(z, dtype=float)
     with np.errstate(divide="ignore", invalid="ignore"):
         return np.where(z > 50.0, z, np.log(np.expm1(z)))
+
+
+def _truncate_middle(text: str, max_width: int) -> str:
+    if len(text) <= max_width:
+        return text
+    if max_width <= 3:
+        return text[:max_width]
+
+    left_width = (max_width - 3) // 2
+    right_width = max_width - 3 - left_width
+    return f"{text[:left_width]}...{text[-right_width:]}"
+
+
+def _format_arm_display_name(name: Arm, max_width: int) -> str:
+    text = str(name)
+    if not isinstance(name, str):
+        return _truncate_middle(text, max_width)
+
+    try:
+        local_match = parse_local_openai_model(name)
+    except ValueError:
+        local_match = None
+
+    if local_match is not None:
+        text = f"local/{local_match.api_model_name}"
+    elif name.startswith("openrouter/"):
+        text = name
+    else:
+        text = name.split("/")[-1]
+
+    return _truncate_middle(text, max_width)
 
 
 class BanditBase(ABC):
@@ -186,6 +219,77 @@ class BanditBase(ABC):
         with open(path, "rb") as f:
             state = pickle.load(f)
         self.set_state(state)
+
+    def _state_arm_names(self) -> Optional[List[str]]:
+        if self._arm_names is None:
+            return None
+        return list(self._arm_names)
+
+    def _align_state_array(
+        self,
+        state: Dict[str, Any],
+        key: str,
+        default: np.ndarray,
+    ) -> np.ndarray:
+        if key not in state:
+            return default.copy()
+
+        saved = np.asarray(state[key], dtype=default.dtype)
+        if saved.ndim != 1:
+            raise ValueError(f"bandit state field '{key}' must be one-dimensional")
+
+        aligned = default.copy()
+        saved_arm_names = state.get("arm_names")
+        if saved_arm_names is not None and self._arm_names is not None:
+            saved_name_to_idx = {
+                name: i for i, name in enumerate(saved_arm_names) if i < saved.size
+            }
+            for i, name in enumerate(self._arm_names):
+                saved_i = saved_name_to_idx.get(name)
+                if saved_i is not None:
+                    aligned[i] = saved[saved_i]
+            return aligned
+
+        n = min(saved.size, aligned.size)
+        if n > 0:
+            aligned[:n] = saved[:n]
+        return aligned
+
+    def _state_arm_layout_matches(self, state: Dict[str, Any], key: str) -> bool:
+        saved_arm_names = state.get("arm_names")
+        if saved_arm_names is not None and self._arm_names is not None:
+            return list(saved_arm_names) == self._arm_names
+        if key not in state:
+            return True
+        return np.asarray(state[key]).size == self.n_arms
+
+    def _restore_observation_range(self, state: Dict[str, Any]) -> None:
+        if self._state_arm_layout_matches(state, "s"):
+            self._obs_max = state["obs_max"]
+            self._obs_min = state["obs_min"]
+            return
+
+        seen = self.divs > 0.0
+        means = self._mean()[seen]
+        finite_means = means[np.isfinite(means)]
+
+        if self.asymmetric_scaling:
+            if self.use_exponential_scaling:
+                self._obs_min = -np.inf
+                self._obs_max = (
+                    float(finite_means.max()) if finite_means.size > 0 else -np.inf
+                )
+            else:
+                self._obs_min = 0.0
+                self._obs_max = (
+                    max(0.0, float(finite_means.max()))
+                    if finite_means.size > 0
+                    else 0.0
+                )
+            return
+
+        self._obs_max = float(finite_means.max()) if finite_means.size > 0 else -np.inf
+        self._obs_min = float(finite_means.min()) if finite_means.size > 0 else np.inf
 
 
 class AsymmetricUCB(BanditBase):
@@ -468,6 +572,32 @@ class AsymmetricUCB(BanditBase):
 
         return cost_ref / cost_denom
 
+    def _restore_cost_range(self, state: Dict[str, Any]) -> None:
+        if (
+            self._state_arm_layout_matches(state, "n_costs")
+            and "min_cost_observed" in state
+            and "max_cost_observed" in state
+        ):
+            self.min_cost_observed = float(state["min_cost_observed"])
+            self.max_cost_observed = float(state["max_cost_observed"])
+            return
+
+        have_cost = self.n_costs > 0.0
+        if not np.any(have_cost):
+            self.min_cost_observed = np.inf
+            self.max_cost_observed = -np.inf
+            return
+
+        mean_costs = self.total_costs[have_cost] / self.n_costs[have_cost]
+        finite_costs = mean_costs[np.isfinite(mean_costs)]
+        if finite_costs.size == 0:
+            self.min_cost_observed = np.inf
+            self.max_cost_observed = -np.inf
+            return
+
+        self.min_cost_observed = float(finite_costs.min())
+        self.max_cost_observed = float(finite_costs.max())
+
     def posterior(self, subset=None, samples=None):
         idx = self._resolve_subset(subset)
         if samples is None or int(samples) <= 1:
@@ -648,13 +778,6 @@ class AsymmetricUCB(BanditBase):
         names = self._arm_names or [str(i) for i in range(self._n_arms)]
         post = self.posterior()
         n = self.n.astype(int)
-        mean = self._mean()
-        if self.use_exponential_scaling:
-            mean_disp = mean  # keep in log space
-            mean_label = "log mean"
-        else:
-            mean_disp = mean
-            mean_label = "mean"
         idx = np.arange(self._n_arms)
 
         # exploitation and exploration components
@@ -740,31 +863,25 @@ class AsymmetricUCB(BanditBase):
             box=rich.box.ROUNDED,
             show_header=True,
             header_style="bold cyan",
-            width=150,
+            width=120,
         )
 
         # Add columns
-        table.add_column("arm", style="white", width=16)
-        table.add_column("n", justify="right", style="green")
-        table.add_column("n_cost", justify="right", style="green")
-        table.add_column("div", justify="right", style="yellow")
-        table.add_column(mean_label, justify="right", style="blue")
-        table.add_column("tot_cost", justify="right", style="yellow")
-        table.add_column("mean_cost", justify="right", style="yellow")
-        table.add_column("exploit", justify="right", style="magenta")
-        table.add_column("explore", justify="right", style="cyan")
-        table.add_column("score_raw", justify="right", style="white")
-        table.add_column("score_cost", justify="right", style="white")
-        table.add_column("score", justify="right", style="bold white")
-        table.add_column("post", justify="right", style="bright_green")
+        table.add_column("arm", style="white", width=24)
+        table.add_column("n", justify="right", style="green", width=4)
+        table.add_column("n_cost", justify="right", style="green", width=7)
+        table.add_column("tot_cost", justify="right", style="yellow", width=8)
+        table.add_column("mean_cost", justify="right", style="yellow", width=8)
+        table.add_column("exploit", justify="right", style="magenta", width=8)
+        table.add_column("explore", justify="right", style="cyan", width=8)
+        table.add_column("score_raw", justify="right", style="white", width=8)
+        table.add_column("score_cost", justify="right", style="white", width=6)
+        table.add_column("score", justify="right", style="bold white", width=8)
+        table.add_column("post", justify="right", style="bright_green", width=6)
 
         # Add rows
         for i, name in enumerate(names):
-            # Split name by "/" and take last part, then last 25 chars
-            if isinstance(name, str):
-                display_name = name.split("/")[-1][-25:]
-            else:
-                display_name = str(name)
+            display_name = _format_arm_display_name(name, max_width=25)
 
             if n_costs[i] > 0:
                 mean_cost_str = f"{mean_costs[i]:.4f}"
@@ -780,8 +897,6 @@ class AsymmetricUCB(BanditBase):
                 display_name,
                 f"{n[i]:d}",
                 f"{n_costs[i]:d}",
-                f"{self.divs[i]:.3f}",
-                f"{mean_disp[i]:.4f}",
                 f"{tot_cost[i]:.4f}",
                 mean_cost_str,
                 f"{exploitation[i]:.4f}",
@@ -799,6 +914,7 @@ class AsymmetricUCB(BanditBase):
     def get_state(self) -> Dict[str, Any]:
         """Get the internal state for serialization."""
         return {
+            "arm_names": self._state_arm_names(),
             "n_submitted": self.n_submitted.copy(),
             "n_completed": self.n_completed.copy(),
             "s": self.s.copy(),
@@ -808,19 +924,27 @@ class AsymmetricUCB(BanditBase):
             "obs_min": self._obs_min,
             "n_costs": self.n_costs.copy(),
             "total_costs": self.total_costs.copy(),
+            "min_cost_observed": self.min_cost_observed,
+            "max_cost_observed": self.max_cost_observed,
         }
 
     def set_state(self, state: Dict[str, Any]) -> None:
         """Restore the internal state from serialization."""
-        self.n_submitted = state["n_submitted"].copy()
-        self.n_completed = state["n_completed"].copy()
-        self.s = state["s"].copy()
-        self.divs = state["divs"].copy()
+        self.n_submitted = self._align_state_array(
+            state, "n_submitted", self.n_submitted
+        )
+        self.n_completed = self._align_state_array(
+            state, "n_completed", self.n_completed
+        )
+        self.s = self._align_state_array(state, "s", self.s)
+        self.divs = self._align_state_array(state, "divs", self.divs)
         self._baseline = state["baseline"]
-        self._obs_max = state["obs_max"]
-        self._obs_min = state["obs_min"]
-        self.n_costs = state["n_costs"].copy()
-        self.total_costs = state["total_costs"].copy()
+        self._restore_observation_range(state)
+        self.n_costs = self._align_state_array(state, "n_costs", self.n_costs)
+        self.total_costs = self._align_state_array(
+            state, "total_costs", self.total_costs
+        )
+        self._restore_cost_range(state)
 
 
 class FixedSampler(BanditBase):
@@ -940,11 +1064,7 @@ class FixedSampler(BanditBase):
 
         # Add rows
         for i, name in enumerate(names):
-            # Split name by "/" and take last part, then last 28 chars
-            if isinstance(name, str):
-                display_name = name.split("/")[-1][-28:]
-            else:
-                display_name = str(name)
+            display_name = _format_arm_display_name(name, max_width=28)
             table.add_row(
                 display_name,
                 f"{n[i]:d}",
@@ -960,6 +1080,7 @@ class FixedSampler(BanditBase):
     def get_state(self) -> Dict[str, Any]:
         """Get the internal state for serialization."""
         return {
+            "arm_names": self._state_arm_names(),
             "baseline": self._baseline,
             "p": self.p.copy(),
             "n_pulls": self.n_pulls.copy(),
@@ -970,13 +1091,16 @@ class FixedSampler(BanditBase):
     def set_state(self, state: Dict[str, Any]) -> None:
         """Restore the internal state from serialization."""
         self._baseline = state["baseline"]
-        self.p = state["p"].copy()
-        if "n_pulls" in state:
-            self.n_pulls = state["n_pulls"].copy()
-        if "n_costs" in state:
-            self.n_costs = state["n_costs"].copy()
-        if "total_costs" in state:
-            self.total_costs = state["total_costs"].copy()
+        self.p = self._align_state_array(state, "p", self.p)
+        p_sum = float(self.p.sum())
+        if p_sum <= 0.0:
+            raise ValueError("loaded fixed sampler probabilities must sum to > 0")
+        self.p = self.p / p_sum
+        self.n_pulls = self._align_state_array(state, "n_pulls", self.n_pulls)
+        self.n_costs = self._align_state_array(state, "n_costs", self.n_costs)
+        self.total_costs = self._align_state_array(
+            state, "total_costs", self.total_costs
+        )
 
 
 class ThompsonSampler(BanditBase):
@@ -1300,10 +1424,7 @@ class ThompsonSampler(BanditBase):
         table.add_column("post", justify="right", style="bright_green")
 
         for i, name in enumerate(names):
-            if isinstance(name, str):
-                display_name = name.split("/")[-1][-25:]
-            else:
-                display_name = str(name)
+            display_name = _format_arm_display_name(name, max_width=25)
             table.add_row(
                 display_name,
                 f"{n[i]:d}",
@@ -1321,6 +1442,7 @@ class ThompsonSampler(BanditBase):
     def get_state(self) -> Dict[str, Any]:
         """Get the internal state for serialization."""
         return {
+            "arm_names": self._state_arm_names(),
             "n_submitted": self.n_submitted.copy(),
             "n_completed": self.n_completed.copy(),
             "s": self.s.copy(),
@@ -1334,12 +1456,15 @@ class ThompsonSampler(BanditBase):
 
     def set_state(self, state: Dict[str, Any]) -> None:
         """Restore the internal state from serialization."""
-        self.n_submitted = state["n_submitted"].copy()
-        self.n_completed = state["n_completed"].copy()
-        self.s = state["s"].copy()
-        self.divs = state["divs"].copy()
-        self.alpha = state["alpha"].copy()
-        self.beta = state["beta"].copy()
+        self.n_submitted = self._align_state_array(
+            state, "n_submitted", self.n_submitted
+        )
+        self.n_completed = self._align_state_array(
+            state, "n_completed", self.n_completed
+        )
+        self.s = self._align_state_array(state, "s", self.s)
+        self.divs = self._align_state_array(state, "divs", self.divs)
+        self.alpha = self._align_state_array(state, "alpha", self.alpha)
+        self.beta = self._align_state_array(state, "beta", self.beta)
         self._baseline = state["baseline"]
-        self._obs_max = state["obs_max"]
-        self._obs_min = state["obs_min"]
+        self._restore_observation_range(state)
